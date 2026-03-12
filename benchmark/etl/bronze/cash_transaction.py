@@ -1,0 +1,47 @@
+"""
+Bronze layer loader for CashTransaction.txt.
+
+Ingests raw pipe-delimited cash transaction data without parsing.
+"""
+
+import logging
+from typing import Optional
+from pyspark.sql import DataFrame
+from benchmark.etl.bronze.base import BronzeLoaderBase
+
+logger = logging.getLogger(__name__)
+
+
+class BronzeCashTransaction(BronzeLoaderBase):
+    """
+    Bronze layer loader for CashTransaction.txt.
+    
+    CashTransaction.txt is pipe-delimited transaction data.
+    
+    At Bronze layer, we store each line as a raw string.
+    """
+    
+    def load(self, batch_id: int, target_table: str) -> Optional[DataFrame]:
+        """
+        Ingest CashTransaction.txt as raw pipe-delimited data.
+        
+        Args:
+            batch_id: Batch number
+            target_table: Full target table name
+            
+        Returns:
+            DataFrame with raw_line column, or None if file not found
+        """
+        logger.info(f"Loading bronze_cash_transaction from Batch{batch_id}")
+        
+        file_path = f"Batch{batch_id}/CashTransaction.txt"
+        
+        try:
+            df = self.platform.read_raw_file(file_path, format="text")
+            bronze_df = df.withColumnRenamed("value", "raw_line")
+            
+            return self._write_bronze_table(bronze_df, target_table, batch_id, "CashTransaction.txt")
+            
+        except Exception as e:
+            logger.warning(f"CashTransaction.txt not found for Batch{batch_id}: {e}")
+            return None
