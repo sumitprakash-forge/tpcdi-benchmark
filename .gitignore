@@ -29,3 +29,7 @@ Thumbs.db
 
 # Data generator output (large)
 tools/datagen/output/
+
+# Node
+node_modules/
+npm-debug.log*
