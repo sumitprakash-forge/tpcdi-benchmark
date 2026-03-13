@@ -1,8 +1,8 @@
 """API routes for TPC-DI benchmark operations."""
 import json
 import traceback
-from typing import Optional
-from fastapi import APIRouter, HTTPException
+from typing import Optional, List
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from server.config import get_workspace_client
@@ -52,7 +52,7 @@ class DataGenJobRequest(BaseModel):
     local_gen_path: str = "/local_disk0"
     upload_threads: int = 8
     skip_if_exists: bool = True
-    notebook_path: str = "/Repos/sumit.prakash@databricks.com/tpcdi-benchmark/databricks/generate_tpcdi_data_notebook"
+    notebook_path: str = "/Workspace/Users/sumit.prakash@databricks.com/tpcdi-benchmark/databricks/generate_tpcdi_data_notebook"
     job_id: Optional[int] = None
 
 
@@ -232,15 +232,19 @@ async def create_datagen_job(req: DataGenJobRequest):
         }
 
         if req.job_id:
-            from databricks.sdk.service.jobs import JobSettings
-            w.jobs.reset(
-                job_id=req.job_id,
-                new_settings=JobSettings.from_dict(job_settings),
+            resp = w.api_client.do(
+                "POST",
+                "/api/2.1/jobs/reset",
+                body={"job_id": req.job_id, "new_settings": job_settings},
             )
             return {"status": "success", "job_id": req.job_id, "action": "updated"}
         else:
-            job = w.jobs.create(**job_settings)
-            return {"status": "success", "job_id": job.job_id, "action": "created"}
+            resp = w.api_client.do(
+                "POST",
+                "/api/2.1/jobs/create",
+                body=job_settings,
+            )
+            return {"status": "success", "job_id": resp["job_id"], "action": "created"}
 
     except Exception as e:
         traceback.print_exc()
@@ -300,7 +304,7 @@ async def create_job(req: JobCreateRequest):
                     "job_cluster_key": "benchmark_cluster",
                     "libraries": [{"jar": jar_path}],
                     "notebook_task": {
-                        "notebook_path": "/Repos/sumit.prakash@databricks.com/tpcdi-benchmark/databricks/benchmark_databricks_notebook",
+                        "notebook_path": "/Workspace/Users/sumit.prakash@databricks.com/tpcdi-benchmark/databricks/benchmark_databricks_notebook",
                         "base_parameters": base_parameters,
                         "source": "WORKSPACE",
                     },
@@ -311,17 +315,21 @@ async def create_job(req: JobCreateRequest):
         }
 
         if req.job_id:
-            # Update existing job
-            from databricks.sdk.service.jobs import JobSettings
-            w.jobs.reset(
-                job_id=req.job_id,
-                new_settings=JobSettings.from_dict(job_settings),
+            # Update existing job via REST API
+            resp = w.api_client.do(
+                "POST",
+                "/api/2.1/jobs/reset",
+                body={"job_id": req.job_id, "new_settings": job_settings},
             )
             return {"status": "success", "job_id": req.job_id, "action": "updated"}
         else:
-            # Create new job
-            job = w.jobs.create(**job_settings)
-            return {"status": "success", "job_id": job.job_id, "action": "created"}
+            # Create new job via REST API
+            resp = w.api_client.do(
+                "POST",
+                "/api/2.1/jobs/create",
+                body=job_settings,
+            )
+            return {"status": "success", "job_id": resp["job_id"], "action": "created"}
 
     except Exception as e:
         traceback.print_exc()
@@ -367,6 +375,63 @@ async def get_job_status(run_id: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── Job Runs ───────────────────────────────────────────────────────────────
+
+@router.get("/databricks/job-runs/{job_id}")
+async def list_job_runs(job_id: int, limit: int = Query(10)):
+    """List recent runs for a job."""
+    try:
+        w = get_workspace_client()
+        resp = w.api_client.do(
+            "GET",
+            "/api/2.1/jobs/runs/list",
+            query={"job_id": job_id, "limit": limit, "expand_tasks": "false"},
+        )
+        runs = []
+        for r in resp.get("runs", []):
+            state = r.get("state", {})
+            runs.append({
+                "run_id": r.get("run_id"),
+                "run_name": r.get("run_name", ""),
+                "state": state.get("life_cycle_state", "UNKNOWN"),
+                "result_state": state.get("result_state"),
+                "state_message": state.get("state_message", ""),
+                "run_page_url": r.get("run_page_url", ""),
+                "start_time": r.get("start_time"),
+                "end_time": r.get("end_time"),
+                "execution_duration": r.get("execution_duration"),
+                "setup_duration": r.get("setup_duration"),
+            })
+        return {"runs": runs, "has_more": resp.get("has_more", False)}
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/databricks/list-jobs")
+async def list_benchmark_jobs():
+    """List recent TPC-DI benchmark jobs."""
+    try:
+        w = get_workspace_client()
+        resp = w.api_client.do(
+            "GET",
+            "/api/2.1/jobs/list",
+            query={"limit": 20, "name": "TPC-DI"},
+        )
+        jobs = []
+        for j in resp.get("jobs", []):
+            settings = j.get("settings", {})
+            jobs.append({
+                "job_id": j.get("job_id"),
+                "name": settings.get("name", ""),
+                "created_time": j.get("created_time"),
+            })
+        return {"jobs": jobs}
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ── List Resources ──────────────────────────────────────────────────────────
 
 @router.get("/databricks/list-catalogs")
@@ -393,6 +458,106 @@ async def list_credentials():
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Metrics / Results ──────────────────────────────────────────────────────
+
+@router.get("/metrics/list")
+async def list_metrics(metrics_path: str = Query("gs://sumit_prakash_gcs/tpcdi/metrics")):
+    """List and return all metrics JSON files using Databricks SQL to read from GCS."""
+    try:
+        w = get_workspace_client()
+        metrics = []
+
+        # Use Databricks SQL Statement API to list and read JSON files via Spark
+        # This works for GCS, DBFS, Volumes - any path Spark can access
+        # Use SQL to read all metrics JSON files via Spark (works for GCS, DBFS, Volumes)
+        # collect_list groups all lines per file, then we join them to get the full JSON
+        sql = f"""
+            SELECT _metadata.file_path as file_name,
+                   concat_ws('', collect_list(value)) as content
+            FROM read_files(
+                '{metrics_path}',
+                format => 'text',
+                pathGlobFilter => 'metrics_*.json'
+            )
+            GROUP BY _metadata.file_path
+        """
+
+        # Find an available SQL warehouse
+        warehouses = w.api_client.do("GET", "/api/2.0/sql/warehouses")
+        warehouse_id = None
+        for wh in warehouses.get("warehouses", []):
+            if wh.get("state") in ("RUNNING", "STOPPED"):
+                warehouse_id = wh["id"]
+                break
+
+        if not warehouse_id:
+            if not metrics_path.startswith("gs://"):
+                return await _list_metrics_dbfs(w, metrics_path)
+            return {"metrics": [], "error": "No SQL warehouse available. Create one to read GCS metrics."}
+
+        stmt_resp = w.api_client.do(
+            "POST",
+            "/api/2.0/sql/statements",
+            body={
+                "warehouse_id": warehouse_id,
+                "statement": sql,
+                "wait_timeout": "50s",
+                "disposition": "INLINE",
+                "format": "JSON_ARRAY",
+            },
+        )
+
+        status = stmt_resp.get("status", {}).get("state", "")
+        if status == "FAILED":
+            error_msg = stmt_resp.get("status", {}).get("error", {}).get("message", "Unknown error")
+            return {"metrics": [], "error": f"SQL failed: {error_msg}"}
+
+        if status not in ("SUCCEEDED",):
+            return {"metrics": [], "error": f"SQL status: {status}. Try again in a moment."}
+
+        # Parse results - each row is [file_path, json_content_string]
+        rows = stmt_resp.get("result", {}).get("data_array", [])
+
+        for row in rows:
+            if len(row) >= 2 and row[1]:
+                try:
+                    data = json.loads(row[1])
+                    data["_source_file"] = row[0].split("/")[-1] if row[0] else "unknown"
+                    metrics.append(data)
+                except Exception as e:
+                    print(f"Warning: skip {row[0]}: {e}")
+
+        # Sort by start_time descending
+        metrics.sort(key=lambda m: m.get("start_time", 0), reverse=True)
+
+        return {"metrics": metrics, "count": len(metrics)}
+
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _list_metrics_dbfs(w, metrics_path: str):
+    """Fallback: read metrics from DBFS."""
+    metrics = []
+    try:
+        entries = w.dbfs.list(metrics_path)
+        for entry in entries:
+            if entry.path and entry.path.endswith(".json") and "metrics_" in entry.path:
+                try:
+                    with w.dbfs.open(entry.path) as f:
+                        data = json.loads(f.read())
+                        data["_source_file"] = entry.path.split("/")[-1]
+                        metrics.append(data)
+                except Exception as e:
+                    print(f"Warning: skip {entry.path}: {e}")
+    except Exception as e:
+        return {"metrics": [], "error": str(e)}
+
+    metrics.sort(key=lambda m: m.get("start_time", 0), reverse=True)
+    return {"metrics": metrics, "count": len(metrics)}
 
 
 # ── Health ──────────────────────────────────────────────────────────────────

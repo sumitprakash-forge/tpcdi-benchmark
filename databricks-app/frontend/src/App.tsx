@@ -2,19 +2,22 @@ import { useState } from 'react'
 import DataGenTab from './components/DataGenTab'
 import DatabricksTab from './components/DatabricksTab'
 import DataprocTab from './components/DataprocTab'
+import ResultsTab from './components/ResultsTab'
 
-type TabKey = 'datagen' | 'databricks' | 'dataproc'
+type TabKey = 'datagen' | 'databricks' | 'dataproc' | 'results'
 
 const tabs: { key: TabKey; label: string; color: string }[] = [
   { key: 'datagen', label: 'Data Generation', color: 'emerald' },
   { key: 'databricks', label: 'Databricks', color: 'orange' },
   { key: 'dataproc', label: 'Dataproc', color: 'blue' },
+  { key: 'results', label: 'Results', color: 'purple' },
 ]
 
 const activeColors: Record<string, string> = {
   emerald: 'bg-emerald-600 text-white',
   orange: 'bg-orange-500 text-white',
   blue: 'bg-blue-600 text-white',
+  purple: 'bg-purple-600 text-white',
 }
 
 function App() {
@@ -47,6 +50,7 @@ function App() {
         {activeTab === 'datagen' && <DataGenTab />}
         {activeTab === 'databricks' && <DatabricksTab />}
         {activeTab === 'dataproc' && <DataprocTab />}
+        {activeTab === 'results' && <ResultsTab />}
       </main>
     </div>
   )

@@ -22,6 +22,27 @@ interface JobStatus {
   setup_duration: number | null
 }
 
+interface RunInfo {
+  run_id: number
+  run_name: string
+  state: string
+  result_state: string | null
+  state_message: string
+  run_page_url: string
+  start_time: number | null
+  end_time: number | null
+  execution_duration: number | null
+  setup_duration: number | null
+}
+
+interface JobInfo {
+  job_id: number
+  name: string
+  created_time: number | null
+}
+
+const STORAGE_KEY = 'tpcdi_databricks_job_id'
+
 export default function DatabricksTab() {
   // Setup state
   const [catalogName, setCatalogName] = useState('gcp_tpcdi_classic')
@@ -85,10 +106,26 @@ export default function DatabricksTab() {
     }
   })()
 
-  // Run state
-  const [jobId, setJobId] = useState<number | null>(null)
+  // Run state - restore jobId from localStorage
+  const [jobId, setJobId] = useState<number | null>(() => {
+    const saved = localStorage.getItem(STORAGE_KEY)
+    return saved ? parseInt(saved, 10) : null
+  })
   const [runId, setRunId] = useState<number | null>(null)
   const [jobStatus, setJobStatus] = useState<JobStatus | null>(null)
+  const [jobRuns, setJobRuns] = useState<RunInfo[]>([])
+  const [loadingRuns, setLoadingRuns] = useState(false)
+  const [availableJobs, setAvailableJobs] = useState<JobInfo[]>([])
+  const [manualJobId, setManualJobId] = useState('')
+
+  // Persist jobId to localStorage
+  useEffect(() => {
+    if (jobId) {
+      localStorage.setItem(STORAGE_KEY, String(jobId))
+    } else {
+      localStorage.removeItem(STORAGE_KEY)
+    }
+  }, [jobId])
 
   // Loading states
   const [loadingCred, setLoadingCred] = useState(false)
@@ -132,6 +169,38 @@ export default function DatabricksTab() {
   // Compute default jar path
   const effectiveJarPath =
     jarPath || `/Volumes/${targetCatalog}/${targetSchema}/libs/spark-xml_2.13-0.18.0.jar`
+
+  // ── Load available jobs and runs on mount & when jobId changes ──────────
+
+  const loadJobRuns = useCallback(async (jid: number) => {
+    setLoadingRuns(true)
+    try {
+      const data = await apiCall(`/api/databricks/job-runs/${jid}?limit=15`)
+      setJobRuns(data.runs || [])
+      // If there's an active run, start polling it
+      const activeRun = (data.runs || []).find(
+        (r: RunInfo) => r.state === 'RUNNING' || r.state === 'PENDING' || r.state === 'QUEUED'
+      )
+      if (activeRun) {
+        setRunId(activeRun.run_id)
+      }
+    } catch (e: any) {
+      console.error('Failed to load runs:', e)
+    } finally {
+      setLoadingRuns(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    // Load available jobs on mount
+    apiCall('/api/databricks/list-jobs')
+      .then((data) => setAvailableJobs(data.jobs || []))
+      .catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    if (jobId) loadJobRuns(jobId)
+  }, [jobId, loadJobRuns])
 
   // ── Setup Actions ────────────────────────────────────────────────────────
 
@@ -202,7 +271,6 @@ export default function DatabricksTab() {
   async function handleCreateVolume() {
     setLoadingVolume(true)
     try {
-      // First ensure schema exists
       const result = await apiCall('/api/databricks/create-volume', {
         method: 'POST',
         body: JSON.stringify({ catalog: catalogName, schema_name: targetSchema, name: 'libs' }),
@@ -264,6 +332,8 @@ export default function DatabricksTab() {
       })
       setRunId(result.run_id)
       addToast(`Benchmark started: Run ID ${result.run_id}`, 'success')
+      // Refresh run list
+      setTimeout(() => loadJobRuns(jobId), 2000)
     } catch (e: any) {
       addToast(`Failed to start benchmark: ${e.message}`, 'error')
     } finally {
@@ -271,13 +341,37 @@ export default function DatabricksTab() {
     }
   }
 
-  // ── Status Polling ───────────────────────────────────────────────────────
+  function handleLoadJobId() {
+    const parsed = parseInt(manualJobId, 10)
+    if (parsed) {
+      setJobId(parsed)
+      setManualJobId('')
+      addToast(`Loaded job ID: ${parsed}`, 'info')
+    }
+  }
+
+  // ── Status Polling ─────────────────────────────────────────────────────
 
   const pollStatus = useCallback(async () => {
     if (!runId) return
     try {
       const status = await apiCall(`/api/databricks/job-status/${runId}`)
       setJobStatus(status)
+      // Update the run in jobRuns list too
+      setJobRuns((prev) =>
+        prev.map((r) =>
+          r.run_id === runId
+            ? {
+                ...r,
+                state: status.state,
+                result_state: status.result_state,
+                state_message: status.state_message,
+                execution_duration: status.execution_duration,
+                setup_duration: status.setup_duration,
+              }
+            : r
+        )
+      )
     } catch {
       // Ignore polling errors
     }
@@ -290,19 +384,19 @@ export default function DatabricksTab() {
     return () => clearInterval(interval)
   }, [runId, pollStatus])
 
-  // Stop polling when terminal state is reached
   const isTerminal =
     jobStatus?.state === 'TERMINATED' ||
     jobStatus?.state === 'SKIPPED' ||
     jobStatus?.state === 'INTERNAL_ERROR'
 
+  // When current run finishes, refresh the runs list
   useEffect(() => {
-    if (isTerminal && runId) {
-      // One final poll happened, no need to continue
+    if (isTerminal && jobId) {
+      loadJobRuns(jobId)
     }
-  }, [isTerminal, runId])
+  }, [isTerminal, jobId, loadJobRuns])
 
-  function formatDuration(ms: number | null) {
+  function formatDuration(ms: number | null | undefined) {
     if (!ms) return '--'
     const seconds = Math.floor(ms / 1000)
     const minutes = Math.floor(seconds / 60)
@@ -310,6 +404,28 @@ export default function DatabricksTab() {
     if (hours > 0) return `${hours}h ${minutes % 60}m ${seconds % 60}s`
     if (minutes > 0) return `${minutes}m ${seconds % 60}s`
     return `${seconds}s`
+  }
+
+  function formatTimestamp(ts: number | null | undefined) {
+    if (!ts) return '--'
+    return new Date(ts).toLocaleString()
+  }
+
+  function stateColor(state: string, resultState: string | null | undefined) {
+    if (state === 'TERMINATED' && resultState === 'SUCCESS') return 'bg-green-100 text-green-700'
+    if (state === 'TERMINATED') return 'bg-red-100 text-red-700'
+    if (state === 'RUNNING') return 'bg-blue-100 text-blue-700'
+    if (state === 'PENDING' || state === 'QUEUED') return 'bg-yellow-100 text-yellow-700'
+    if (state === 'SKIPPED') return 'bg-slate-100 text-slate-600'
+    if (state === 'INTERNAL_ERROR') return 'bg-red-100 text-red-700'
+    return 'bg-slate-100 text-slate-600'
+  }
+
+  function stateLabel(state: string, resultState: string | null | undefined) {
+    if (state === 'TERMINATED' && resultState === 'SUCCESS') return 'SUCCESS'
+    if (state === 'TERMINATED') return resultState || 'FAILED'
+    if (state === 'INTERNAL_ERROR') return 'ERROR'
+    return state
   }
 
   return (
@@ -471,7 +587,8 @@ export default function DatabricksTab() {
       {/* Run Section */}
       <Section title="3. Run Benchmark" defaultOpen={true}>
         <div className="pt-4">
-          <div className="flex flex-wrap gap-3 items-center">
+          {/* Job selector / loader */}
+          <div className="flex flex-wrap gap-3 items-center mb-4">
             <ActionButton label={jobId ? 'Update Job' : 'Create Job'} onClick={handleCreateJob} loading={loadingJob} />
             <ActionButton
               label="Run Benchmark"
@@ -483,32 +600,59 @@ export default function DatabricksTab() {
             {jobId && (
               <span className="text-sm text-slate-500">
                 Job ID: <span className="font-mono font-medium text-slate-700">{jobId}</span>
+                <button
+                  onClick={() => { setJobId(null); setRunId(null); setJobStatus(null); setJobRuns([]) }}
+                  className="ml-2 text-xs text-red-400 hover:text-red-600"
+                  title="Clear job"
+                >
+                  clear
+                </button>
               </span>
             )}
           </div>
 
-          {/* Job Status Display */}
-          {jobStatus && (
-            <div className="mt-5 p-4 bg-slate-50 rounded-lg border border-slate-200">
-              <h4 className="text-sm font-semibold text-slate-700 mb-3">Run Status</h4>
+          {/* Load existing job */}
+          {!jobId && (
+            <div className="mb-4 p-3 bg-slate-50 rounded-lg border border-slate-200">
+              <p className="text-xs text-slate-500 mb-2">Load an existing job by ID or select from recent jobs:</p>
+              <div className="flex gap-2 items-center mb-2">
+                <input
+                  type="text"
+                  value={manualJobId}
+                  onChange={(e) => setManualJobId(e.target.value)}
+                  placeholder="Enter Job ID"
+                  className="border border-slate-300 rounded-md px-3 py-1.5 text-sm w-48 focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent"
+                  onKeyDown={(e) => e.key === 'Enter' && handleLoadJobId()}
+                />
+                <ActionButton label="Load" onClick={handleLoadJobId} variant="secondary" />
+              </div>
+              {availableJobs.length > 0 && (
+                <div className="flex flex-wrap gap-2">
+                  {availableJobs.map((j) => (
+                    <button
+                      key={j.job_id}
+                      onClick={() => setJobId(j.job_id)}
+                      className="text-xs px-3 py-1.5 bg-white border border-slate-200 rounded-md hover:bg-orange-50 hover:border-orange-300 transition-colors"
+                    >
+                      <span className="font-mono text-orange-600">{j.job_id}</span>
+                      <span className="text-slate-500 ml-1.5">{j.name}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Current Run Status */}
+          {jobStatus && runId && (
+            <div className="mb-4 p-4 bg-slate-50 rounded-lg border border-slate-200">
+              <h4 className="text-sm font-semibold text-slate-700 mb-3">Current Run</h4>
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                 <div>
                   <p className="text-xs text-slate-500 uppercase">State</p>
-                  <p className="text-sm font-medium">
-                    <span
-                      className={`inline-block px-2 py-0.5 rounded text-xs font-medium ${
-                        jobStatus.state === 'TERMINATED' && jobStatus.result_state === 'SUCCESS'
-                          ? 'bg-green-100 text-green-700'
-                          : jobStatus.state === 'TERMINATED'
-                          ? 'bg-red-100 text-red-700'
-                          : jobStatus.state === 'RUNNING'
-                          ? 'bg-blue-100 text-blue-700'
-                          : 'bg-yellow-100 text-yellow-700'
-                      }`}
-                    >
-                      {jobStatus.result_state || jobStatus.state}
-                    </span>
-                  </p>
+                  <span className={`inline-block px-2 py-0.5 rounded text-xs font-medium ${stateColor(jobStatus.state, jobStatus.result_state)}`}>
+                    {stateLabel(jobStatus.state, jobStatus.result_state)}
+                  </span>
                 </div>
                 <div>
                   <p className="text-xs text-slate-500 uppercase">Run ID</p>
@@ -526,23 +670,90 @@ export default function DatabricksTab() {
               {jobStatus.state_message && (
                 <div className="mt-3">
                   <p className="text-xs text-slate-500 uppercase">Message</p>
-                  <p className="text-sm text-slate-600 mt-1">{jobStatus.state_message}</p>
+                  <p className="text-sm text-slate-600 mt-1 break-words">{jobStatus.state_message}</p>
                 </div>
               )}
               {jobStatus.run_page_url && (
-                <div className="mt-3">
-                  <a
-                    href={jobStatus.run_page_url}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-sm text-orange-600 hover:text-orange-700 underline"
-                  >
-                    View Run in Databricks
-                  </a>
-                </div>
+                <a
+                  href={jobStatus.run_page_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-block mt-2 text-sm text-orange-600 hover:text-orange-700 underline"
+                >
+                  View Run in Databricks
+                </a>
               )}
-              {!isTerminal && runId && (
+              {!isTerminal && (
                 <p className="mt-2 text-xs text-slate-400">Auto-refreshing every 10 seconds...</p>
+              )}
+            </div>
+          )}
+
+          {/* Run History */}
+          {jobId && (
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <h4 className="text-sm font-semibold text-slate-700">Run History</h4>
+                <button
+                  onClick={() => loadJobRuns(jobId)}
+                  disabled={loadingRuns}
+                  className="text-xs text-orange-600 hover:text-orange-700 disabled:opacity-50"
+                >
+                  {loadingRuns ? 'Refreshing...' : 'Refresh'}
+                </button>
+              </div>
+              {jobRuns.length === 0 && !loadingRuns && (
+                <p className="text-sm text-slate-400">No runs yet. Click "Run Benchmark" to start one.</p>
+              )}
+              {jobRuns.length > 0 && (
+                <div className="border border-slate-200 rounded-lg overflow-hidden">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="bg-slate-50 text-left text-slate-500 uppercase tracking-wide">
+                        <th className="px-3 py-2">Status</th>
+                        <th className="px-3 py-2">Run ID</th>
+                        <th className="px-3 py-2">Started</th>
+                        <th className="px-3 py-2">Setup</th>
+                        <th className="px-3 py-2">Execution</th>
+                        <th className="px-3 py-2">Message</th>
+                        <th className="px-3 py-2"></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {jobRuns.map((r) => (
+                        <tr
+                          key={r.run_id}
+                          className={`border-t border-slate-100 hover:bg-slate-50 ${r.run_id === runId ? 'bg-orange-50' : ''}`}
+                        >
+                          <td className="px-3 py-2">
+                            <span className={`inline-block px-2 py-0.5 rounded text-[10px] font-medium ${stateColor(r.state, r.result_state)}`}>
+                              {stateLabel(r.state, r.result_state)}
+                            </span>
+                          </td>
+                          <td className="px-3 py-2 font-mono">{r.run_id}</td>
+                          <td className="px-3 py-2 text-slate-500">{formatTimestamp(r.start_time)}</td>
+                          <td className="px-3 py-2 font-mono">{formatDuration(r.setup_duration)}</td>
+                          <td className="px-3 py-2 font-mono">{formatDuration(r.execution_duration)}</td>
+                          <td className="px-3 py-2 text-slate-500 max-w-xs truncate" title={r.state_message}>
+                            {r.state_message ? r.state_message.slice(0, 80) + (r.state_message.length > 80 ? '...' : '') : '--'}
+                          </td>
+                          <td className="px-3 py-2">
+                            {r.run_page_url && (
+                              <a
+                                href={r.run_page_url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-orange-600 hover:text-orange-700 underline"
+                              >
+                                View
+                              </a>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
               )}
             </div>
           )}
