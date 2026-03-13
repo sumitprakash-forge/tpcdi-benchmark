@@ -8,6 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
 from server.routes import router
+from server.dataproc_routes import router as dataproc_router
 
 
 @asynccontextmanager
@@ -16,6 +17,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="TPC-DI Benchmark", lifespan=lifespan)
 app.include_router(router, prefix="/api")
+app.include_router(dataproc_router, prefix="/api")
 
 # Serve React frontend
 frontend_dist = Path(__file__).parent / "frontend" / "dist"

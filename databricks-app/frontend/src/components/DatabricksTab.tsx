@@ -51,13 +51,25 @@ interface JobInfo {
 }
 
 const STORAGE_KEY = 'tpcdi_databricks_job_id'
+const E2E_STATE_KEY = 'tpcdi_e2e_state'
+
+interface E2EPersistedState {
+  steps: E2EStep[]
+  sf: string
+  runId: number | null
+  activeStep: number | null
+  running: boolean
+  costs: (RunCost | null)[]
+  remainingSpecs: E2ERunSpec[]  // specs still to run after the active one completes
+}
 
 interface PrereqStep {
   step: string
   name: string
-  status: 'exists' | 'created' | 'missing' | 'error'
+  status: 'exists' | 'created' | 'missing' | 'error' | 'skipped'
   error?: string
   sa_email?: string
+  gcs_bucket?: string
   url?: string
 }
 
@@ -87,19 +99,113 @@ interface PrereqCheckResult {
   resources: Record<string, PrereqCheckResource>
 }
 
+interface PrereqDetail {
+  name: string
+  label: string
+  exists: boolean
+  action?: string // 'exists' | 'created' | 'error'
+  url?: string
+  error?: string
+}
+
+interface E2EStep {
+  name: string
+  status: 'pending' | 'running' | 'success' | 'error'
+  output: string
+  duration_ms: number | null
+  link?: string
+  details?: PrereqDetail[]
+}
+
+interface RunCost {
+  vm_cost_usd: number
+  dbu_cost_usd: number
+  dbu_list_price: number
+  total_dbus: number
+  ssd_cost_usd: number
+  total_cost_usd: number
+  duration_hours: number
+  duration_ms: number
+  exec_duration_ms: number
+  setup_duration_ms: number
+  run_page_url: string
+  cluster: {
+    driver_node_type: string
+    worker_node_type: string
+    num_workers: number
+    local_ssd_count: number
+  }
+}
+
+interface E2ERunSizing {
+  loadType: string
+  batchId: string
+  driver: string
+  worker: string
+  workers: number
+  ssds: number
+  label: string
+}
+
+function getE2ESizing(sf: number, loadType: string): Omit<E2ERunSizing, 'loadType' | 'batchId' | 'label'> {
+  if (loadType === 'batch') {
+    if (sf <= 100) return { driver: 'n2d-standard-8', worker: 'n2d-standard-8', workers: 3, ssds: 2 }
+    if (sf <= 1000) return { driver: 'n2d-standard-8', worker: 'n2d-standard-8', workers: 5, ssds: 2 }
+    return { driver: 'n2d-standard-8', worker: 'n2d-standard-16', workers: 6, ssds: 4 }
+  } else {
+    if (sf <= 100) return { driver: 'n2d-standard-8', worker: 'n2d-standard-8', workers: 3, ssds: 2 }
+    if (sf <= 1000) return { driver: 'n2d-standard-8', worker: 'n2d-standard-8', workers: 3, ssds: 2 }
+    return { driver: 'n2d-standard-8', worker: 'n2d-standard-16', workers: 5, ssds: 2 }
+  }
+}
+
+function buildE2ESteps(sf: string): E2EStep[] {
+  return [
+    { name: 'Check & Create Prerequisites', status: 'pending', output: '', duration_ms: null },
+    {
+      name: `Batch Load (SF ${sf})`,
+      status: 'pending', output: '', duration_ms: null,
+    },
+    {
+      name: `Incremental Load - Batch 2 (SF ${sf})`,
+      status: 'pending', output: '', duration_ms: null,
+    },
+    {
+      name: `Incremental Load - Batch 3 (SF ${sf})`,
+      status: 'pending', output: '', duration_ms: null,
+    },
+  ]
+}
+
+interface E2ERunSpec {
+  loadType: string
+  batchId: string
+  stepIndex: number
+}
+
+const E2E_RUN_SPECS: E2ERunSpec[] = [
+  { loadType: 'batch', batchId: '', stepIndex: 1 },
+  { loadType: 'incremental', batchId: '2', stepIndex: 2 },
+  { loadType: 'incremental', batchId: '3', stepIndex: 3 },
+]
+
 export default function DatabricksTab() {
+  // Mode toggle
+  const [mode, setMode] = useState<'e2e' | 'manual'>('e2e')
+
   // Prerequisites state
-  const [catalogName] = useState('gcp_tpcdi_classic')
+  const [catalogName, setCatalogName] = useState('gcp_tpcdi_sandbox')
   const [rawDataPath, setRawDataPath] = useState('gs://sumit_prakash_gcs/tpcdi')
   const [prereqCheck, setPrereqCheck] = useState<PrereqCheckResult | null>(null)
   const [prereqResult, setPrereqResult] = useState<PrereqResult | null>(null)
   const [loadingPrereqCheck, setLoadingPrereqCheck] = useState(false)
   const [loadingPrereqCreate, setLoadingPrereqCreate] = useState(false)
+  const [fixingGcsIam, setFixingGcsIam] = useState(false)
 
   // Benchmark config state
   const [loadType, setLoadType] = useState('batch')
   const [scaleFactor, setScaleFactor] = useState('10')
-  const [targetCatalog, setTargetCatalog] = useState('gcp_tpcdi_classic')
+  const [targetCatalog, setTargetCatalog] = useState('gcp_tpcdi_sandbox')
   const [targetSchema, setTargetSchema] = useState('dw')
   const [batchId, setBatchId] = useState('')
   const [cloud, setCloud] = useState('GCP')
@@ -109,6 +215,7 @@ export default function DatabricksTab() {
   const [driverNodeType, setDriverNodeType] = useState('n2-highmem-16')
   const [numWorkers, setNumWorkers] = useState(3)
   const [jarPath, setJarPath] = useState('')
+  const [localSsds, setLocalSsds] = useState(2)
   const [photon, setPhoton] = useState(true)
   const [logDetailedStats, setLogDetailedStats] = useState(true)
 
@@ -182,6 +289,22 @@ export default function DatabricksTab() {
   const [loadingJobs, setLoadingJobs] = useState(false)
   const [manualJobId, setManualJobId] = useState('')
 
+  // End-to-End state - restore from localStorage
+  const savedE2E = useRef<E2EPersistedState | null>((() => {
+    try {
+      const raw = localStorage.getItem(E2E_STATE_KEY)
+      return raw ? JSON.parse(raw) : null
+    } catch { return null }
+  })())
+  const [e2eSteps, setE2eSteps] = useState<E2EStep[]>(savedE2E.current?.steps || buildE2ESteps('1000'))
+  const [e2eRunning, setE2eRunning] = useState(savedE2E.current?.running || false)
+  const [e2eSF, setE2eSF] = useState(savedE2E.current?.sf || '1000')
+  const [e2eRunId, setE2eRunId] = useState<number | null>(savedE2E.current?.runId || null)
+  const [e2eActiveStep, setE2eActiveStep] = useState<number | null>(savedE2E.current?.activeStep || null)
+  const [runCosts, setRunCosts] = useState<(RunCost | null)[]>(savedE2E.current?.costs || [null, null, null])
+  const [e2eRemainingSpecs, setE2eRemainingSpecs] = useState<E2ERunSpec[]>(savedE2E.current?.remainingSpecs || [])
+  const benchmarkNotebookPath = useRef<string>('')
+
   // Persist jobId to localStorage
   useEffect(() => {
     if (jobId) {
@@ -190,6 +313,20 @@ export default function DatabricksTab() {
       localStorage.removeItem(STORAGE_KEY)
     }
   }, [jobId])
+
+  // Persist E2E state to localStorage
+  useEffect(() => {
+    const state: E2EPersistedState = {
+      steps: e2eSteps,
+      sf: e2eSF,
+      runId: e2eRunId,
+      activeStep: e2eActiveStep,
+      running: e2eRunning,
+      costs: runCosts,
+      remainingSpecs: e2eRemainingSpecs,
+    }
+    localStorage.setItem(E2E_STATE_KEY, JSON.stringify(state))
+  }, [e2eSteps, e2eSF, e2eRunId, e2eActiveStep, e2eRunning, runCosts, e2eRemainingSpecs])
 
   // Loading states
   const [loadingJob, setLoadingJob] = useState(false)
@@ -276,6 +413,23 @@ export default function DatabricksTab() {
     }
   }
 
+  async function handleFixGcsIam(saEmail: string, gcsBucket: string) {
+    setFixingGcsIam(true)
+    try {
+      const data = await apiCall('/api/databricks/grant-gcs-iam', {
+        method: 'POST',
+        body: JSON.stringify({ sa_email: saEmail, gcs_bucket: gcsBucket }),
+      })
+      addToast(data.message || 'GCS IAM grant applied', 'success')
+      // Re-run prerequisites to pick up the fix
+      await handleCreatePrerequisites()
+    } catch (e: any) {
+      addToast(`GCS IAM fix failed: ${e.message}. Sign in on Dataproc tab first.`, 'error')
+    } finally {
+      setFixingGcsIam(false)
+    }
+  }
+
   // ── Load available jobs and runs on mount & when jobId changes ──────────
 
   const loadJobRuns = useCallback(async (jid: number) => {
@@ -340,6 +494,7 @@ export default function DatabricksTab() {
           num_workers: numWorkers,
           jar_path: effectiveJarPath,
           photon,
+          local_ssds: localSsds,
           log_detailed_stats: logDetailedStats,
           job_id: jobId,
         }),
@@ -382,6 +537,281 @@ export default function DatabricksTab() {
       setManualJobId('')
       addToast(`Loaded job ID: ${parsed}`, 'info')
     }
+  }
+
+  // ── End-to-End Run ─────────────────────────────────────────────────────
+
+  function updateE2EStep(index: number, updates: Partial<E2EStep>) {
+    setE2eSteps(prev => prev.map((s, i) => i === index ? { ...s, ...updates } : s))
+  }
+
+  const e2eCancelledRef = useRef(false)
+  const e2eStartingRef = useRef(false)  // gates auto-continue while a spec is being kicked off
+
+  // Build run label from spec
+  function buildRunLabel(spec: E2ERunSpec, sf: number): string {
+    const sizing = getE2ESizing(sf, spec.loadType)
+    return spec.loadType === 'batch'
+      ? `SF ${sf} | Batch | ${sizing.worker} x${sizing.workers}, ${sizing.ssds} SSDs`
+      : `SF ${sf} | Incremental Batch ${spec.batchId} | ${sizing.worker} x${sizing.workers}, ${sizing.ssds} SSDs`
+  }
+
+  // Kick off the next run spec: create job → start run → set e2eRunId (polling picks it up)
+  async function startE2ERunSpec(spec: E2ERunSpec) {
+    e2eStartingRef.current = true  // prevent auto-continue from firing during async setup
+    const sf = parseInt(e2eSF)
+    const { loadType, batchId, stepIndex } = spec
+    const sizing = getE2ESizing(sf, loadType)
+    const runLabel = buildRunLabel(spec, sf)
+
+    setE2eActiveStep(stepIndex)
+    updateE2EStep(stepIndex, { status: 'running', output: `${runLabel} | Creating job...` })
+
+    let createdJobId: number | null = null
+    try {
+      const jobResult = await apiCall('/api/databricks/create-job', {
+        method: 'POST',
+        body: JSON.stringify({
+          job_name: `TPC-DI Benchmark SF${sf} ${loadType}${batchId ? ' batch' + batchId : ''}`,
+          load_type: loadType,
+          scale_factor: sf,
+          raw_data_path: rawDataPath,
+          catalog: catalogName,
+          schema_name: targetSchema,
+          batch_id: batchId,
+          cloud: 'GCP',
+          xml_format: 'com.databricks.spark.xml',
+          spark_version: '17.3.x-scala2.13',
+          worker_node_type: sizing.worker,
+          driver_node_type: sizing.driver,
+          num_workers: sizing.workers,
+          jar_path: `/Volumes/${catalogName}/${targetSchema}/libs/spark-xml_2.13-0.18.0.jar`,
+          notebook_path: benchmarkNotebookPath.current || '',
+          photon: true,
+          local_ssds: sizing.ssds,
+          log_detailed_stats: true,
+        }),
+      })
+      createdJobId = jobResult.job_id
+      updateE2EStep(stepIndex, { output: `${runLabel} | Job ${jobResult.action} (ID: ${jobResult.job_id}). Starting run...` })
+    } catch (e: any) {
+      updateE2EStep(stepIndex, { status: 'error', output: `${runLabel} | Job creation failed: ${e.message}` })
+      setE2eRunning(false)
+      setE2eRemainingSpecs([])
+      e2eStartingRef.current = false
+      return
+    }
+
+    try {
+      const runResult = await apiCall('/api/databricks/run-job', {
+        method: 'POST',
+        body: JSON.stringify({ job_id: createdJobId }),
+      })
+      setE2eRunId(runResult.run_id)
+      updateE2EStep(stepIndex, {
+        status: 'running',
+        output: `${runLabel} | Run ${runResult.run_id} started. Polling...`,
+      })
+    } catch (e: any) {
+      updateE2EStep(stepIndex, { status: 'error', output: `${runLabel} | ${e.message}` })
+      setE2eRunning(false)
+      setE2eRemainingSpecs([])
+    }
+    e2eStartingRef.current = false
+  }
+
+  // Polling useEffect - runs whenever e2eRunId changes (including after page refresh)
+  useEffect(() => {
+    if (!e2eRunId || e2eActiveStep === null) return
+    const stepIdx = e2eActiveStep
+    const sf = parseInt(e2eSF)
+    // Find matching spec to build label
+    const spec = E2E_RUN_SPECS.find(s => s.stepIndex === stepIdx)
+    const runLabel = spec ? buildRunLabel(spec, sf) : `Step ${stepIdx}`
+
+    const poll = async () => {
+      try {
+        const status = await apiCall(`/api/databricks/job-status/${e2eRunId}`)
+        const stateStr = status.result_state
+          ? `${status.state} (${status.result_state})`
+          : status.state
+
+        updateE2EStep(stepIdx, {
+          output: `${runLabel} | Status: ${stateStr}. Setup: ${formatDuration(status.setup_duration)}, Exec: ${formatDuration(status.execution_duration)}`,
+          link: status.run_page_url || undefined,
+          duration_ms: (status.execution_duration || 0) + (status.setup_duration || 0),
+        })
+
+        const terminal = status.state === 'TERMINATED' || status.state === 'SKIPPED' || status.state === 'INTERNAL_ERROR'
+        if (terminal) {
+          const isSuccess = status.state === 'TERMINATED' && status.result_state === 'SUCCESS'
+          updateE2EStep(stepIdx, {
+            status: isSuccess ? 'success' : 'error',
+            output: `${runLabel} | ${stateStr}. Setup: ${formatDuration(status.setup_duration)}, Exec: ${formatDuration(status.execution_duration)}${status.state_message ? ' - ' + status.state_message : ''}`,
+            link: status.run_page_url || undefined,
+            duration_ms: (status.execution_duration || 0) + (status.setup_duration || 0),
+          })
+          // Fetch cost
+          if (isSuccess) {
+            try {
+              const costData = await apiCall(`/api/databricks/run-cost/${e2eRunId}`)
+              setRunCosts(prev => {
+                const next = [...prev]
+                next[stepIdx - 1] = costData
+                return next
+              })
+            } catch { /* ignore */ }
+          }
+          setE2eRunId(null)
+          // If failed or cancelled, stop pipeline
+          if (!isSuccess) {
+            setE2eRunning(false)
+            setE2eActiveStep(null)
+            setE2eRemainingSpecs([])
+          }
+          return true
+        }
+      } catch { /* ignore */ }
+      return false
+    }
+
+    // Initial poll
+    poll().then((done) => {
+      if (done) return
+    })
+    const interval = setInterval(async () => {
+      const done = await poll()
+      if (done) clearInterval(interval)
+    }, 10000)
+    return () => clearInterval(interval)
+  }, [e2eRunId, e2eActiveStep])
+
+  // Auto-continue: when a run completes (e2eRunId becomes null) and there are remaining specs
+  useEffect(() => {
+    if (e2eRunId !== null || !e2eRunning) return
+    if (e2eCancelledRef.current) {
+      setE2eRunning(false)
+      setE2eRemainingSpecs([])
+      return
+    }
+    // All specs done — pipeline complete
+    if (e2eRemainingSpecs.length === 0) {
+      setE2eRunning(false)
+      setE2eActiveStep(null)
+      return
+    }
+    // Don't auto-continue while a spec is being started (prevents race condition)
+    if (e2eStartingRef.current) return
+    // Pop next spec and start it
+    const [next, ...rest] = e2eRemainingSpecs
+    setE2eRemainingSpecs(rest)
+    startE2ERunSpec(next)
+  }, [e2eRunId, e2eRunning, e2eRemainingSpecs])
+
+  // Main E2E handler: prereqs then queue all run specs
+  async function handleRunE2E() {
+    const steps = buildE2ESteps(e2eSF)
+    setE2eSteps(steps)
+    setE2eRunning(true)
+    setRunCosts([null, null, null])
+    setE2eRunId(null)
+    setE2eActiveStep(null)
+    setE2eRemainingSpecs([])
+    e2eCancelledRef.current = false
+
+    // Step 0: Prerequisites
+    updateE2EStep(0, { status: 'running', output: 'Checking prerequisites...', details: [] })
+    const step0Start = Date.now()
+    try {
+      const checkData = await apiCall(`/api/databricks/check-prerequisites?catalog_name=${encodeURIComponent(catalogName)}&schema_name=${encodeURIComponent(targetSchema)}&raw_data_path=${encodeURIComponent(rawDataPath)}`)
+      const checkDetails: PrereqDetail[] = Object.entries(checkData.resources || {}).map(([key, res]: [string, any]) => ({
+        name: res.name,
+        label: key.replace(/_/g, ' '),
+        exists: res.exists,
+        action: res.exists ? 'exists' : 'missing',
+        url: res.url || undefined,
+      }))
+      if (checkData.status === 'ready') {
+        updateE2EStep(0, { status: 'success', output: 'All prerequisites already exist.', duration_ms: Date.now() - step0Start, details: checkDetails })
+      } else {
+        updateE2EStep(0, { output: 'Some prerequisites missing. Creating...', details: checkDetails })
+        const createData = await apiCall('/api/databricks/verify-prerequisites', {
+          method: 'POST',
+          body: JSON.stringify({ catalog_name: catalogName, schema_name: targetSchema, raw_data_path: rawDataPath }),
+        })
+        const createDetails: PrereqDetail[] = (createData.steps || []).map((s: any) => ({
+          name: s.name,
+          label: s.step.replace(/_/g, ' '),
+          exists: s.status === 'exists' || s.status === 'created',
+          action: s.status,
+          url: s.url || undefined,
+          error: s.error || undefined,
+        }))
+        if (createData.status === 'ready') {
+          updateE2EStep(0, { status: 'success', output: 'All prerequisites ready.', duration_ms: Date.now() - step0Start, details: createDetails })
+        } else {
+          const errors = (createData.steps || []).filter((s: any) => s.status === 'error').map((s: any) => `${s.step}: ${s.error}`).join('; ')
+          updateE2EStep(0, { status: 'error', output: `Failed: ${errors}`, duration_ms: Date.now() - step0Start, details: createDetails })
+          setE2eRunning(false)
+          return
+        }
+      }
+      await checkPrerequisites()
+
+      // Bootstrap: deploy notebooks + JAR to workspace
+      updateE2EStep(0, { output: 'Deploying notebooks & spark-xml JAR...' })
+      const bootstrap = await apiCall('/api/databricks/bootstrap', {
+        method: 'POST',
+        body: JSON.stringify({ catalog_name: catalogName, schema_name: targetSchema }),
+      })
+      const bootstrapDetails: PrereqDetail[] = (bootstrap.steps || []).map((s: any) => ({
+        name: s.name,
+        label: s.step.replace(/_/g, ' '),
+        exists: s.status === 'exists' || s.status === 'created',
+        action: s.status,
+        error: s.error || undefined,
+      }))
+      if (bootstrap.status !== 'ready') {
+        const errors = (bootstrap.steps || []).filter((s: any) => s.status === 'error').map((s: any) => `${s.step}: ${s.error}`).join('; ')
+        updateE2EStep(0, { status: 'error', output: `Bootstrap failed: ${errors}`, duration_ms: Date.now() - step0Start, details: bootstrapDetails })
+        setE2eRunning(false)
+        return
+      }
+      benchmarkNotebookPath.current = bootstrap.benchmark_notebook || ''
+      updateE2EStep(0, { status: 'success', output: 'Prerequisites ready. Notebooks & JAR deployed.', duration_ms: Date.now() - step0Start })
+    } catch (e: any) {
+      updateE2EStep(0, { status: 'error', output: e.message, duration_ms: Date.now() - step0Start })
+      setE2eRunning(false)
+      return
+    }
+
+    // Queue all run specs - first one starts immediately, rest are remaining
+    const [first, ...rest] = E2E_RUN_SPECS
+    setE2eRemainingSpecs(rest)
+    await startE2ERunSpec(first)
+  }
+
+  const [cancelling, setCancelling] = useState(false)
+
+  async function handleCancelE2E() {
+    if (!e2eRunId) return
+    setCancelling(true)
+    e2eCancelledRef.current = true
+    try {
+      await apiCall(`/api/databricks/cancel-run/${e2eRunId}`, { method: 'POST' })
+      addToast(`Run ${e2eRunId} cancellation requested`, 'info')
+      if (e2eActiveStep !== null) {
+        updateE2EStep(e2eActiveStep, { output: `Cancellation requested for run ${e2eRunId}. Waiting for confirmation...` })
+      }
+    } catch (e: any) {
+      addToast(`Failed to cancel: ${e.message}`, 'error')
+    } finally {
+      setCancelling(false)
+    }
+  }
+
+  function formatCost(usd: number) {
+    return `$${usd.toFixed(4)}`
   }
 
   // ── Status Polling ─────────────────────────────────────────────────────
@@ -468,6 +898,222 @@ export default function DatabricksTab() {
         <Toast key={t.id} message={t.message} type={t.type} onClose={() => removeToast(t.id)} />
       ))}
 
+      {/* Mode Toggle */}
+      <div className="flex items-center gap-1 mb-6 p-1 bg-slate-100 rounded-lg w-fit">
+        <button
+          onClick={() => setMode('e2e')}
+          className={`px-4 py-2 text-sm font-medium rounded-md transition-all ${
+            mode === 'e2e'
+              ? 'bg-white text-orange-700 shadow-sm'
+              : 'text-slate-500 hover:text-slate-700'
+          }`}
+        >
+          End to End
+        </button>
+        <button
+          onClick={() => setMode('manual')}
+          className={`px-4 py-2 text-sm font-medium rounded-md transition-all ${
+            mode === 'manual'
+              ? 'bg-white text-orange-700 shadow-sm'
+              : 'text-slate-500 hover:text-slate-700'
+          }`}
+        >
+          Manual
+        </button>
+      </div>
+
+      {/* ── End-to-End Mode ─────────────────────────────────────────── */}
+      {mode === 'e2e' && (
+        <Section title="End-to-End Benchmark Run" defaultOpen={true} colorScheme="blue">
+          <div className="pt-4">
+            {/* Config Row */}
+            <div className="flex flex-wrap items-end gap-4 mb-6">
+              <FormField label="Scale Factor">
+                <SelectInput
+                  value={e2eSF}
+                  onChange={setE2eSF}
+                  options={[
+                    { value: '100', label: 'SF 100' },
+                    { value: '1000', label: 'SF 1000' },
+                    { value: '10000', label: 'SF 10000' },
+                  ]}
+                />
+              </FormField>
+              <FormField label="Catalog">
+                <input className="px-3 py-2 bg-white border border-slate-200 rounded-md text-sm font-mono text-slate-700" value={catalogName} onChange={e => setCatalogName(e.target.value)} />
+              </FormField>
+              <FormField label="Raw Data Path">
+                <div className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-md text-sm font-mono text-slate-700 max-w-[260px] truncate" title={rawDataPath}>{rawDataPath}</div>
+              </FormField>
+              <ActionButton
+                label={e2eRunning ? 'Running...' : 'Run Full Pipeline'}
+                onClick={handleRunE2E}
+                loading={e2eRunning}
+                disabled={e2eRunning}
+              />
+              {e2eRunning && e2eRunId && (
+                <button
+                  onClick={handleCancelE2E}
+                  disabled={cancelling}
+                  className="px-4 py-2 text-sm font-medium rounded-md border border-red-300 text-red-600 hover:bg-red-50 disabled:opacity-50 transition-all"
+                >
+                  {cancelling ? 'Cancelling...' : 'Cancel Run'}
+                </button>
+              )}
+            </div>
+
+            {/* Step Progress Cards */}
+            <div className="space-y-3">
+              {e2eSteps.map((step, i) => (
+                <div
+                  key={i}
+                  className={`p-4 rounded-lg border transition-all ${
+                    step.status === 'pending' ? 'bg-slate-50 border-slate-200' :
+                    step.status === 'running' ? 'bg-blue-50 border-blue-300 shadow-sm' :
+                    step.status === 'success' ? 'bg-green-50 border-green-300' :
+                    'bg-red-50 border-red-300'
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                      <span className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold ${
+                        step.status === 'pending' ? 'bg-slate-200 text-slate-500' :
+                        step.status === 'running' ? 'bg-blue-500 text-white animate-pulse' :
+                        step.status === 'success' ? 'bg-green-500 text-white' :
+                        'bg-red-500 text-white'
+                      }`}>
+                        {step.status === 'success' ? '\u2713' : step.status === 'error' ? '!' : i + 1}
+                      </span>
+                      <span className="text-sm font-semibold text-slate-700">{step.name}</span>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      {step.duration_ms !== null && (
+                        <span className="text-xs font-mono text-slate-500">{formatDuration(step.duration_ms)}</span>
+                      )}
+                      {step.link && (
+                        <a
+                          href={step.link}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-xs text-orange-600 hover:text-orange-700 underline"
+                        >
+                          View Run
+                        </a>
+                      )}
+                      <span className={`text-[10px] font-medium uppercase px-2 py-0.5 rounded ${
+                        step.status === 'pending' ? 'bg-slate-200 text-slate-500' :
+                        step.status === 'running' ? 'bg-blue-100 text-blue-700' :
+                        step.status === 'success' ? 'bg-green-100 text-green-700' :
+                        'bg-red-100 text-red-700'
+                      }`}>
+                        {step.status}
+                      </span>
+                    </div>
+                  </div>
+                  {step.output && (
+                    <p className="mt-2 text-xs text-slate-600 ml-10 break-words">{step.output}</p>
+                  )}
+                  {/* Prereq resource details */}
+                  {step.details && step.details.length > 0 && (
+                    <div className="mt-3 ml-10 grid grid-cols-1 sm:grid-cols-3 gap-2">
+                      {step.details.map((d, di) => (
+                        <div key={di} className="flex items-start gap-2 p-2 rounded-md bg-white/70 border border-slate-100">
+                          <span className={`mt-0.5 w-4 h-4 rounded-full flex items-center justify-center text-[9px] font-bold flex-shrink-0 ${
+                            d.exists ? (d.action === 'created' ? 'bg-blue-500 text-white' : 'bg-green-500 text-white') : 'bg-red-400 text-white'
+                          }`}>
+                            {d.exists ? (d.action === 'created' ? '+' : '\u2713') : '\u00d7'}
+                          </span>
+                          <div className="min-w-0">
+                            <p className="text-[11px] font-medium text-slate-700 capitalize">{d.label}</p>
+                            <p className="text-[10px] text-slate-500 font-mono truncate" title={d.name}>{d.name}</p>
+                            {d.action && d.action !== 'exists' && d.action !== 'missing' && (
+                              <span className={`inline-block mt-0.5 text-[9px] font-medium px-1.5 py-0.5 rounded ${
+                                d.action === 'created' ? 'bg-blue-100 text-blue-700' :
+                                d.action === 'error' ? 'bg-red-100 text-red-700' :
+                                'bg-slate-100 text-slate-600'
+                              }`}>{d.action}</span>
+                            )}
+                            {d.url && <p className="text-[9px] text-slate-400 truncate" title={d.url}>{d.url}</p>}
+                            {d.error && <p className="text-[9px] text-red-500 truncate" title={d.error}>{d.error}</p>}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+
+            {/* Cost Breakdown - per run */}
+            {runCosts.some(c => c !== null) && (
+              <div className="mt-6 space-y-4">
+                {(() => {
+                  const totalCost = runCosts.reduce((sum, c) => sum + (c?.total_cost_usd || 0), 0)
+                  const totalDuration = runCosts.reduce((sum, c) => sum + (c?.duration_ms || 0), 0)
+                  return (
+                    <div className="p-4 bg-gradient-to-r from-orange-50 to-amber-50 rounded-lg border border-orange-200">
+                      <div className="flex items-center justify-between">
+                        <h4 className="text-sm font-bold text-orange-800">Pipeline Total</h4>
+                        <div className="flex items-center gap-6">
+                          <div className="text-right">
+                            <p className="text-[10px] text-orange-600 uppercase">Total Cost</p>
+                            <p className="text-xl font-bold text-orange-700">{formatCost(totalCost)}</p>
+                          </div>
+                          <div className="text-right">
+                            <p className="text-[10px] text-orange-600 uppercase">Total Duration</p>
+                            <p className="text-xl font-bold text-orange-700">{formatDuration(totalDuration)}</p>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  )
+                })()}
+                {runCosts.map((cost, ci) => {
+                  if (!cost) return null
+                  const labels = ['Batch', 'Incremental Batch 2', 'Incremental Batch 3']
+                  return (
+                    <div key={ci} className="p-4 bg-gradient-to-r from-slate-50 to-blue-50 rounded-lg border border-slate-200">
+                      <h4 className="text-sm font-bold text-slate-700 mb-3">{labels[ci]} (SF {e2eSF})</h4>
+                      <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+                        <div className="bg-white rounded-lg p-2.5 border border-slate-100">
+                          <p className="text-[10px] text-slate-500 uppercase">VM Compute</p>
+                          <p className="text-base font-bold text-slate-800">{formatCost(cost.vm_cost_usd)}</p>
+                        </div>
+                        <div className="bg-white rounded-lg p-2.5 border border-slate-100">
+                          <p className="text-[10px] text-slate-500 uppercase">DBU Cost</p>
+                          <p className="text-base font-bold text-slate-800">{formatCost(cost.dbu_cost_usd)}</p>
+                          <p className="text-[9px] text-slate-400">{cost.total_dbus} DBUs @ {formatCost(cost.dbu_list_price)}/DBU</p>
+                        </div>
+                        <div className="bg-white rounded-lg p-2.5 border border-slate-100">
+                          <p className="text-[10px] text-slate-500 uppercase">Local SSD</p>
+                          <p className="text-base font-bold text-slate-800">{formatCost(cost.ssd_cost_usd)}</p>
+                          <p className="text-[9px] text-slate-400">{cost.cluster.local_ssd_count} SSD(s)</p>
+                        </div>
+                        <div className="bg-white rounded-lg p-2.5 border border-orange-200 bg-orange-50">
+                          <p className="text-[10px] text-orange-600 uppercase font-semibold">Total</p>
+                          <p className="text-base font-bold text-orange-700">{formatCost(cost.total_cost_usd)}</p>
+                        </div>
+                        <div className="bg-white rounded-lg p-2.5 border border-slate-100">
+                          <p className="text-[10px] text-slate-500 uppercase">Duration</p>
+                          <p className="text-sm font-mono text-slate-700">{formatDuration(cost.duration_ms)}</p>
+                          <p className="text-[9px] text-slate-400">{cost.cluster.worker_node_type} x{cost.cluster.num_workers}</p>
+                        </div>
+                      </div>
+                      {cost.run_page_url && (
+                        <a href={cost.run_page_url} target="_blank" rel="noopener noreferrer" className="inline-block mt-2 text-xs text-orange-600 hover:text-orange-700 underline">View Run</a>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        </Section>
+      )}
+
+      {/* ── Manual Mode ──────────────────────────────────────────────── */}
+      {mode === 'manual' && (
+      <>
       {/* Prerequisites Section */}
       <Section title="1. Create & Verify Prerequisites" defaultOpen={true} colorScheme="emerald">
         <div className="pt-4">
@@ -547,14 +1193,24 @@ export default function DatabricksTab() {
                         <span className={`inline-block px-2 py-0.5 rounded text-[10px] font-medium ${
                           s.status === 'exists' ? 'bg-green-100 text-green-700' :
                           s.status === 'created' ? 'bg-blue-100 text-blue-700' :
+                          s.status === 'skipped' ? 'bg-amber-100 text-amber-700' :
                           s.status === 'missing' ? 'bg-amber-100 text-amber-700' :
                           'bg-red-100 text-red-700'
                         }`}>
                           {s.status.toUpperCase()}
                         </span>
                       </td>
-                      <td className="px-3 py-2 text-slate-500 max-w-xs truncate">
-                        {s.error || s.sa_email || s.url || '--'}
+                      <td className="px-3 py-2 text-slate-500 max-w-xs">
+                        <div className="truncate">{s.error || s.sa_email || s.url || '--'}</div>
+                        {s.step === 'external_location' && (s.status === 'skipped' || s.status === 'error') && s.sa_email && s.gcs_bucket && (
+                          <button
+                            onClick={() => handleFixGcsIam(s.sa_email!, s.gcs_bucket!)}
+                            disabled={fixingGcsIam}
+                            className="mt-1 px-2 py-0.5 text-[10px] font-medium rounded bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
+                          >
+                            {fixingGcsIam ? 'Fixing...' : 'Fix GCS Access'}
+                          </button>
+                        )}
                       </td>
                     </tr>
                   ))}
@@ -669,9 +1325,9 @@ export default function DatabricksTab() {
               value={sparkVersion}
               onChange={setSparkVersion}
               options={[
-                { value: '17.3.x-scala2.13', label: '17.3.x-scala2.13 (LTS)' },
-                { value: '16.4.x-scala2.12', label: '16.4.x-scala2.12 (LTS)' },
-                { value: '15.4.x-scala2.12', label: '15.4.x-scala2.12 (LTS)' },
+                { value: '17.3.x-scala2.13', label: '17.3 LTS (Scala 2.13)' },
+                { value: '17.3.x-photon-scala2.13', label: '17.3 LTS Photon (Scala 2.13)' },
+                { value: '17.2.x-scala2.13', label: '17.2 (Scala 2.13)' },
               ]}
             />
           </FormField>
@@ -683,6 +1339,9 @@ export default function DatabricksTab() {
           </FormField>
           <FormField label="Number of Workers">
             <NumberInput value={numWorkers} onChange={setNumWorkers} min={1} max={100} />
+          </FormField>
+          <FormField label="Local SSDs per Node">
+            <NumberInput value={localSsds} onChange={setLocalSsds} min={0} max={8} />
           </FormField>
           <div className="lg:col-span-3">
             <FormField label="JAR Library Path" hint={`Default: ${effectiveJarPath}`}>
@@ -921,6 +1580,8 @@ export default function DatabricksTab() {
           )}
         </div>
       </Section>
+      )}
+      </>
       )}
     </div>
   )
