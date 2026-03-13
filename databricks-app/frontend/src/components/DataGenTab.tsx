@@ -27,10 +27,11 @@ export default function DataGenTab() {
   const [scaleFactor, setScaleFactor] = useState('100')
   const [outputPath, setOutputPath] = useState('gs://sumit_prakash_gcs/tpcdi')
   const [cloud, setCloud] = useState('GCP')
-  const [sparkVersion, setSparkVersion] = useState('17.3.x-scala2.13')
+  const [sparkVersion, setSparkVersion] = useState('16.4.x-scala2.12')
   const [nodeType, setNodeType] = useState('n2-highmem-16')
   const [numWorkers, setNumWorkers] = useState(0)
   const [photon, setPhoton] = useState(false)
+  const [localSsds, setLocalSsds] = useState(1)
   const [localGenPath, setLocalGenPath] = useState('/local_disk0')
   const [uploadThreads, setUploadThreads] = useState(8)
   const [skipIfExists, setSkipIfExists] = useState(true)
@@ -94,6 +95,7 @@ export default function DataGenTab() {
           node_type: nodeType,
           num_workers: numWorkers,
           photon,
+          local_ssds: localSsds,
           cloud,
           local_gen_path: localGenPath,
           upload_threads: uploadThreads,
@@ -191,7 +193,6 @@ export default function DataGenTab() {
                 { value: '10', label: '10 (~1 GB)' },
                 { value: '100', label: '100 (~10 GB)' },
                 { value: '1000', label: '1000 (~100 GB)' },
-                { value: '5000', label: '5000 (~500 GB)' },
                 { value: '10000', label: '10000 (~1 TB)' },
               ]}
             />
@@ -230,7 +231,6 @@ export default function DataGenTab() {
               value={sparkVersion}
               onChange={setSparkVersion}
               options={[
-                { value: '17.3.x-scala2.13', label: '17.3.x-scala2.13 (LTS)' },
                 { value: '16.4.x-scala2.12', label: '16.4.x-scala2.12 (LTS)' },
                 { value: '15.4.x-scala2.12', label: '15.4.x-scala2.12 (LTS)' },
               ]}
@@ -241,6 +241,9 @@ export default function DataGenTab() {
           </FormField>
           <FormField label="Number of Workers" hint="0 = driver-only (datagen is single-threaded Java)">
             <NumberInput value={numWorkers} onChange={setNumWorkers} min={0} max={100} />
+          </FormField>
+          <FormField label="# Local SSDs" hint="Number of local SSDs per node (375 GB each). 0 = none.">
+            <NumberInput value={localSsds} onChange={setLocalSsds} min={0} max={8} />
           </FormField>
           <div className="flex items-end">
             <Checkbox checked={photon} onChange={setPhoton} label="Photon Enabled" />

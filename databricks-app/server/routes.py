@@ -48,6 +48,7 @@ class DataGenJobRequest(BaseModel):
     node_type: str = "n2-highmem-16"
     num_workers: int = 0
     photon: bool = False
+    local_ssds: int = 1
     cloud: str = "GCP"
     local_gen_path: str = "/local_disk0"
     upload_threads: int = 8
@@ -80,97 +81,179 @@ class RunJobRequest(BaseModel):
     job_id: int
 
 
-# ── Storage Credential ─────────────────────────────────────────────────────
+class PrerequisitesRequest(BaseModel):
+    catalog_name: str = "gcp_tpcdi_classic"
+    schema_name: str = "dw"
+    storage_root: str = "gs://"
+    raw_data_path: str = "gs://sumit_prakash_gcs/tpcdi"
+    sa_email: str = ""
+    sa_key_json: str = ""
 
-@router.post("/databricks/create-storage-credential")
-async def create_storage_credential(req: StorageCredentialRequest):
+
+# ── Check Prerequisites (GET - read-only status) ─────────────────────────
+
+@router.get("/databricks/check-prerequisites")
+async def check_prerequisites(
+    catalog_name: str = Query("tpcdi_benchmark"),
+    schema_name: str = Query("dw"),
+    raw_data_path: str = Query("gs://sumit_prakash_gcs/tpcdi"),
+):
+    """Check existence of catalog, credential, external location, schema, volume."""
     try:
         w = get_workspace_client()
-        key_data = json.loads(req.sa_key_json)
+        cred_name = f"{catalog_name}_cred"
+        ext_loc_name = f"{catalog_name}_raw_data"
+        volume_name = "libs"
 
-        from databricks.sdk.service.catalog import GcpServiceAccountKey
-        cred = w.storage_credentials.create(
-            name=req.name,
-            gcp_service_account_key=GcpServiceAccountKey(
-                email=req.sa_email,
-                private_key_id=key_data["private_key_id"],
-                private_key=key_data["private_key"],
-            ),
-            comment=f"TPC-DI benchmark storage credential",
-        )
-        return {"status": "success", "credential_id": str(cred.id), "name": cred.name}
+        results = {
+            "catalog": {"name": catalog_name, "exists": False},
+            "external_location": {"name": ext_loc_name, "exists": False, "url": ""},
+            "volume": {"name": f"{catalog_name}.{schema_name}.{volume_name}", "exists": False},
+        }
+
+        # Check catalog
+        try:
+            cat = w.catalogs.get(catalog_name)
+            results["catalog"]["exists"] = True
+        except Exception:
+            pass
+
+        # Check external location - try by name, then search by URL
+        try:
+            loc = w.external_locations.get(ext_loc_name)
+            results["external_location"]["exists"] = True
+            results["external_location"]["url"] = loc.url or ""
+        except Exception:
+            # Search for any external location matching the raw_data_path
+            try:
+                for loc in w.external_locations.list():
+                    if loc.url and raw_data_path.rstrip("/").startswith(loc.url.rstrip("/")):
+                        results["external_location"]["exists"] = True
+                        results["external_location"]["name"] = loc.name or ext_loc_name
+                        results["external_location"]["url"] = loc.url or ""
+                        break
+            except Exception:
+                pass
+
+        # Check volume
+        try:
+            vol = w.volumes.read(f"{catalog_name}.{schema_name}.{volume_name}")
+            results["volume"]["exists"] = True
+        except Exception:
+            pass
+
+        all_ready = all(v["exists"] for v in results.values())
+        return {"status": "ready" if all_ready else "incomplete", "resources": results}
+
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── Catalog ─────────────────────────────────────────────────────────────────
+# ── Create & Verify Prerequisites (POST - creates missing resources) ──────
 
-@router.post("/databricks/create-catalog")
-async def create_catalog(req: CatalogRequest):
+@router.post("/databricks/verify-prerequisites")
+async def verify_prerequisites(req: PrerequisitesRequest):
+    """Check and create all prerequisites: credential, catalog, ext location, schema, volume."""
     try:
         w = get_workspace_client()
-        catalog = w.catalogs.create(
-            name=req.name,
-            storage_root=req.storage_root,
-            comment="TPC-DI benchmark catalog",
-        )
-        return {"status": "success", "name": catalog.name}
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        cred_name = f"{req.catalog_name}_cred"
+        ext_loc_name = f"{req.catalog_name}_raw_data"
+        volume_name = "libs"
 
+        steps = []
 
-# ── External Location ──────────────────────────────────────────────────────
+        # 1. Catalog
+        catalog_exists = False
+        try:
+            w.catalogs.get(req.catalog_name)
+            catalog_exists = True
+            steps.append({"step": "catalog", "name": req.catalog_name, "status": "exists"})
+        except Exception:
+            pass
 
-@router.post("/databricks/create-external-location")
-async def create_external_location(req: ExternalLocationRequest):
-    try:
-        w = get_workspace_client()
-        loc = w.external_locations.create(
-            name=req.name,
-            url=req.url,
-            credential_name=req.credential_name,
-            comment="TPC-DI benchmark external location for raw data",
-        )
-        return {"status": "success", "name": loc.name, "url": loc.url}
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        if not catalog_exists:
+            try:
+                w.catalogs.create(
+                    name=req.catalog_name,
+                    storage_root=req.storage_root if req.storage_root != "gs://" else None,
+                    comment="TPC-DI benchmark catalog",
+                )
+                catalog_exists = True
+                steps.append({"step": "catalog", "name": req.catalog_name, "status": "created"})
+            except Exception as e:
+                steps.append({"step": "catalog", "name": req.catalog_name, "status": "error", "error": str(e)})
 
+        # 3. External Location - check by name, then search by URL
+        ext_loc_exists = False
+        ext_loc_url = ""
+        try:
+            loc = w.external_locations.get(ext_loc_name)
+            ext_loc_exists = True
+            ext_loc_url = loc.url or ""
+            steps.append({"step": "external_location", "name": ext_loc_name, "status": "exists", "url": ext_loc_url})
+        except Exception:
+            # Search for any external location covering the raw_data_path
+            try:
+                for loc in w.external_locations.list():
+                    if loc.url and req.raw_data_path.rstrip("/").startswith(loc.url.rstrip("/")):
+                        ext_loc_exists = True
+                        ext_loc_name = loc.name or ext_loc_name
+                        ext_loc_url = loc.url or ""
+                        steps.append({"step": "external_location", "name": ext_loc_name, "status": "exists", "url": ext_loc_url})
+                        break
+            except Exception:
+                pass
 
-# ── Schema ──────────────────────────────────────────────────────────────────
+        if not ext_loc_exists:
+            try:
+                loc = w.external_locations.create(
+                    name=ext_loc_name,
+                    url=req.raw_data_path,
+                    credential_name=cred_name,
+                    comment="TPC-DI benchmark external location for raw data",
+                )
+                ext_loc_url = loc.url or req.raw_data_path
+                steps.append({"step": "external_location", "name": ext_loc_name, "status": "created", "url": ext_loc_url})
+            except Exception as e:
+                steps.append({"step": "external_location", "name": ext_loc_name, "status": "error", "error": str(e)})
 
-@router.post("/databricks/create-schema")
-async def create_schema(req: SchemaRequest):
-    try:
-        w = get_workspace_client()
-        schema = w.schemas.create(
-            name=req.name,
-            catalog_name=req.catalog,
-            comment="TPC-DI benchmark schema",
-        )
-        return {"status": "success", "full_name": schema.full_name}
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        # 4. Volume (libs)
+        vol_full = f"{req.catalog_name}.{req.schema_name}.{volume_name}"
+        vol_exists = False
+        try:
+            w.volumes.read(vol_full)
+            vol_exists = True
+            steps.append({"step": "volume", "name": vol_full, "status": "exists"})
+        except Exception:
+            pass
 
+        if not vol_exists and catalog_exists:
+            try:
+                from databricks.sdk.service.catalog import VolumeType
+                w.volumes.create(
+                    catalog_name=req.catalog_name,
+                    schema_name=req.schema_name,
+                    name=volume_name,
+                    volume_type=VolumeType.MANAGED,
+                    comment="TPC-DI benchmark volume for JARs and libraries",
+                )
+                steps.append({"step": "volume", "name": vol_full, "status": "created"})
+            except Exception as e:
+                steps.append({"step": "volume", "name": vol_full, "status": "error", "error": str(e)})
 
-# ── Volume ──────────────────────────────────────────────────────────────────
+        all_ok = all(s.get("status") in ("exists", "created") for s in steps)
+        return {
+            "status": "ready" if all_ok else "incomplete",
+            "steps": steps,
+            "summary": {
+                "catalog": req.catalog_name,
+                "external_location": ext_loc_name,
+                "external_location_url": ext_loc_url,
+                "volume": vol_full,
+            },
+        }
 
-@router.post("/databricks/create-volume")
-async def create_volume(req: VolumeRequest):
-    try:
-        w = get_workspace_client()
-        from databricks.sdk.service.catalog import VolumeType
-        vol = w.volumes.create(
-            catalog_name=req.catalog,
-            schema_name=req.schema_name,
-            name=req.name,
-            volume_type=VolumeType.MANAGED,
-            comment="TPC-DI benchmark volume for JARs and libraries",
-        )
-        return {"status": "success", "full_name": vol.full_name}
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
@@ -202,7 +285,10 @@ async def create_datagen_job(req: DataGenJobRequest):
 
         # Add cloud-specific attributes
         if req.cloud == "GCP":
-            new_cluster["gcp_attributes"] = {"use_preemptible_executors": False}
+            gcp_attrs = {"use_preemptible_executors": False}
+            if req.local_ssds > 0:
+                gcp_attrs["local_ssd_count"] = req.local_ssds
+            new_cluster["gcp_attributes"] = gcp_attrs
 
         job_settings = {
             "name": req.job_name,
@@ -410,7 +496,7 @@ async def list_job_runs(job_id: int, limit: int = Query(10)):
 
 @router.get("/databricks/list-jobs")
 async def list_benchmark_jobs():
-    """List recent TPC-DI benchmark jobs."""
+    """List recent TPC-DI benchmark jobs with latest run status."""
     try:
         w = get_workspace_client()
         resp = w.api_client.do(
@@ -421,11 +507,34 @@ async def list_benchmark_jobs():
         jobs = []
         for j in resp.get("jobs", []):
             settings = j.get("settings", {})
-            jobs.append({
-                "job_id": j.get("job_id"),
+            job_id = j.get("job_id")
+            job_info = {
+                "job_id": job_id,
                 "name": settings.get("name", ""),
                 "created_time": j.get("created_time"),
-            })
+                "latest_run": None,
+            }
+            # Fetch latest run for this job
+            try:
+                runs_resp = w.api_client.do(
+                    "GET",
+                    "/api/2.1/jobs/runs/list",
+                    query={"job_id": job_id, "limit": 1, "expand_tasks": "false"},
+                )
+                runs = runs_resp.get("runs", [])
+                if runs:
+                    r = runs[0]
+                    state = r.get("state", {})
+                    job_info["latest_run"] = {
+                        "run_id": r.get("run_id"),
+                        "state": state.get("life_cycle_state", "UNKNOWN"),
+                        "result_state": state.get("result_state"),
+                        "start_time": r.get("start_time"),
+                        "execution_duration": r.get("execution_duration"),
+                    }
+            except Exception:
+                pass  # Skip if we can't fetch runs for this job
+            jobs.append(job_info)
         return {"jobs": jobs}
     except Exception as e:
         traceback.print_exc()

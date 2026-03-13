@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import Section from './Section'
 import ActionButton from './ActionButton'
-import FormField, { TextInput, NumberInput, SelectInput, TextArea, Checkbox } from './FormField'
+import FormField, { TextInput, NumberInput, SelectInput, Checkbox } from './FormField'
 import Toast from './Toast'
 
 interface ToastMessage {
@@ -35,25 +35,70 @@ interface RunInfo {
   setup_duration: number | null
 }
 
+interface LatestRun {
+  run_id: number
+  state: string
+  result_state: string | null
+  start_time: number | null
+  execution_duration: number | null
+}
+
 interface JobInfo {
   job_id: number
   name: string
   created_time: number | null
+  latest_run: LatestRun | null
 }
 
 const STORAGE_KEY = 'tpcdi_databricks_job_id'
 
+interface PrereqStep {
+  step: string
+  name: string
+  status: 'exists' | 'created' | 'missing' | 'error'
+  error?: string
+  sa_email?: string
+  url?: string
+}
+
+interface PrereqResult {
+  status: 'ready' | 'incomplete'
+  steps: PrereqStep[]
+  summary: {
+    catalog: string
+    credential: string
+    sa_email: string
+    external_location: string
+    external_location_url: string
+    schema: string
+    volume: string
+  }
+}
+
+interface PrereqCheckResource {
+  name: string
+  exists: boolean
+  sa_email?: string
+  url?: string
+}
+
+interface PrereqCheckResult {
+  status: 'ready' | 'incomplete'
+  resources: Record<string, PrereqCheckResource>
+}
+
 export default function DatabricksTab() {
-  // Setup state
-  const [catalogName, setCatalogName] = useState('gcp_tpcdi_classic')
-  const [storageRoot, setStorageRoot] = useState('gs://')
-  const [saEmail, setSaEmail] = useState('')
-  const [saKeyJson, setSaKeyJson] = useState('')
+  // Prerequisites state
+  const [catalogName] = useState('gcp_tpcdi_classic')
+  const [rawDataPath, setRawDataPath] = useState('gs://sumit_prakash_gcs/tpcdi')
+  const [prereqCheck, setPrereqCheck] = useState<PrereqCheckResult | null>(null)
+  const [prereqResult, setPrereqResult] = useState<PrereqResult | null>(null)
+  const [loadingPrereqCheck, setLoadingPrereqCheck] = useState(false)
+  const [loadingPrereqCreate, setLoadingPrereqCreate] = useState(false)
 
   // Benchmark config state
   const [loadType, setLoadType] = useState('batch')
   const [scaleFactor, setScaleFactor] = useState('10')
-  const [rawDataPath, setRawDataPath] = useState('gs://sumit_prakash_gcs/tpcdi')
   const [targetCatalog, setTargetCatalog] = useState('gcp_tpcdi_classic')
   const [targetSchema, setTargetSchema] = useState('dw')
   const [batchId, setBatchId] = useState('')
@@ -93,18 +138,36 @@ export default function DatabricksTab() {
   ]
 
   // Sizing suggestions based on load type and scale factor
-  const sizingSuggestion = (() => {
+  interface SizingConfig {
+    driver: string
+    worker: string
+    workers: number
+    label: string
+  }
+
+  const sizingConfig: SizingConfig | null = (() => {
     const sf = parseInt(scaleFactor)
     if (loadType === 'batch') {
-      if (sf >= 10000) return 'Recommended: Driver n2d-standard-8, Worker n2d-standard-16, 6 workers'
-      if (sf >= 1000) return 'Recommended: Driver n2d-standard-8, Worker n2d-standard-8, 5 workers'
-      return null
+      if (sf <= 10) return { driver: 'n2d-standard-4', worker: 'n2d-standard-4', workers: 2, label: 'Small batch' }
+      if (sf <= 100) return { driver: 'n2d-standard-8', worker: 'n2d-standard-8', workers: 2, label: 'Medium batch' }
+      if (sf <= 1000) return { driver: 'n2d-standard-8', worker: 'n2d-standard-8', workers: 5, label: 'Large batch' }
+      return { driver: 'n2d-standard-8', worker: 'n2d-standard-16', workers: 6, label: 'XL batch' }
     } else {
-      if (sf >= 10000) return 'Recommended: Driver n2d-standard-8, Worker n2d-standard-8, 5 workers'
-      if (sf >= 1000) return 'Recommended: Driver n2d-standard-8, Worker n2d-standard-8, 3 workers'
-      return null
+      if (sf <= 10) return { driver: 'n2d-standard-4', worker: 'n2d-standard-4', workers: 2, label: 'Small incremental' }
+      if (sf <= 100) return { driver: 'n2d-standard-8', worker: 'n2d-standard-4', workers: 2, label: 'Medium incremental' }
+      if (sf <= 1000) return { driver: 'n2d-standard-8', worker: 'n2d-standard-8', workers: 3, label: 'Large incremental' }
+      return { driver: 'n2d-standard-8', worker: 'n2d-standard-16', workers: 5, label: 'XL incremental' }
     }
   })()
+
+  // Apply sizing suggestion when load type or scale factor changes
+  useEffect(() => {
+    if (sizingConfig) {
+      setDriverNodeType(sizingConfig.driver)
+      setWorkerNodeType(sizingConfig.worker)
+      setNumWorkers(sizingConfig.workers)
+    }
+  }, [loadType, scaleFactor])
 
   // Run state - restore jobId from localStorage
   const [jobId, setJobId] = useState<number | null>(() => {
@@ -116,6 +179,7 @@ export default function DatabricksTab() {
   const [jobRuns, setJobRuns] = useState<RunInfo[]>([])
   const [loadingRuns, setLoadingRuns] = useState(false)
   const [availableJobs, setAvailableJobs] = useState<JobInfo[]>([])
+  const [loadingJobs, setLoadingJobs] = useState(false)
   const [manualJobId, setManualJobId] = useState('')
 
   // Persist jobId to localStorage
@@ -128,11 +192,6 @@ export default function DatabricksTab() {
   }, [jobId])
 
   // Loading states
-  const [loadingCred, setLoadingCred] = useState(false)
-  const [loadingCatalog, setLoadingCatalog] = useState(false)
-  const [loadingExtLoc, setLoadingExtLoc] = useState(false)
-  const [loadingSchema, setLoadingSchema] = useState(false)
-  const [loadingVolume, setLoadingVolume] = useState(false)
   const [loadingJob, setLoadingJob] = useState(false)
   const [loadingRun, setLoadingRun] = useState(false)
 
@@ -170,6 +229,53 @@ export default function DatabricksTab() {
   const effectiveJarPath =
     jarPath || `/Volumes/${targetCatalog}/${targetSchema}/libs/spark-xml_2.13-0.18.0.jar`
 
+  // ── Prerequisites check on mount ──────────────────────────────────────
+
+  const checkPrerequisites = useCallback(async (catName?: string) => {
+    const cat = catName || catalogName
+    setLoadingPrereqCheck(true)
+    try {
+      const data = await apiCall(`/api/databricks/check-prerequisites?catalog_name=${encodeURIComponent(cat)}&schema_name=${encodeURIComponent(targetSchema)}&raw_data_path=${encodeURIComponent(rawDataPath)}`)
+      setPrereqCheck(data)
+    } catch {
+      // ignore
+    } finally {
+      setLoadingPrereqCheck(false)
+    }
+  }, [catalogName, targetSchema, rawDataPath])
+
+  useEffect(() => {
+    checkPrerequisites()
+  }, [])
+
+  async function handleCreatePrerequisites() {
+    setLoadingPrereqCreate(true)
+    setPrereqResult(null)
+    try {
+      const data = await apiCall('/api/databricks/verify-prerequisites', {
+        method: 'POST',
+        body: JSON.stringify({
+          catalog_name: catalogName,
+          schema_name: targetSchema,
+          raw_data_path: rawDataPath,
+        }),
+      })
+      setPrereqResult(data)
+      if (data.status === 'ready') {
+        addToast('All prerequisites are ready!', 'success')
+      } else {
+        const errors = (data.steps || []).filter((s: PrereqStep) => s.status === 'error' || s.status === 'missing')
+        addToast(`${errors.length} prerequisite(s) need attention`, 'error')
+      }
+      // Refresh check
+      await checkPrerequisites()
+    } catch (e: any) {
+      addToast(`Prerequisites failed: ${e.message}`, 'error')
+    } finally {
+      setLoadingPrereqCreate(false)
+    }
+  }
+
   // ── Load available jobs and runs on mount & when jobId changes ──────────
 
   const loadJobRuns = useCallback(async (jid: number) => {
@@ -191,97 +297,25 @@ export default function DatabricksTab() {
     }
   }, [])
 
+  const loadAvailableJobs = useCallback(async () => {
+    setLoadingJobs(true)
+    try {
+      const data = await apiCall('/api/databricks/list-jobs')
+      setAvailableJobs(data.jobs || [])
+    } catch {
+      // ignore
+    } finally {
+      setLoadingJobs(false)
+    }
+  }, [])
+
   useEffect(() => {
-    // Load available jobs on mount
-    apiCall('/api/databricks/list-jobs')
-      .then((data) => setAvailableJobs(data.jobs || []))
-      .catch(() => {})
+    loadAvailableJobs()
   }, [])
 
   useEffect(() => {
     if (jobId) loadJobRuns(jobId)
   }, [jobId, loadJobRuns])
-
-  // ── Setup Actions ────────────────────────────────────────────────────────
-
-  async function handleCreateCredential() {
-    setLoadingCred(true)
-    try {
-      const result = await apiCall('/api/databricks/create-storage-credential', {
-        method: 'POST',
-        body: JSON.stringify({ name: `${catalogName}_cred`, sa_email: saEmail, sa_key_json: saKeyJson }),
-      })
-      addToast(`Storage credential "${result.name}" created successfully`, 'success')
-    } catch (e: any) {
-      addToast(`Failed to create credential: ${e.message}`, 'error')
-    } finally {
-      setLoadingCred(false)
-    }
-  }
-
-  async function handleCreateCatalog() {
-    setLoadingCatalog(true)
-    try {
-      const result = await apiCall('/api/databricks/create-catalog', {
-        method: 'POST',
-        body: JSON.stringify({ name: catalogName, storage_root: storageRoot }),
-      })
-      addToast(`Catalog "${result.name}" created successfully`, 'success')
-    } catch (e: any) {
-      addToast(`Failed to create catalog: ${e.message}`, 'error')
-    } finally {
-      setLoadingCatalog(false)
-    }
-  }
-
-  async function handleCreateExternalLocation() {
-    setLoadingExtLoc(true)
-    try {
-      const result = await apiCall('/api/databricks/create-external-location', {
-        method: 'POST',
-        body: JSON.stringify({
-          name: `${catalogName}_raw_data`,
-          url: rawDataPath,
-          credential_name: `${catalogName}_cred`,
-        }),
-      })
-      addToast(`External location "${result.name}" created successfully`, 'success')
-    } catch (e: any) {
-      addToast(`Failed to create external location: ${e.message}`, 'error')
-    } finally {
-      setLoadingExtLoc(false)
-    }
-  }
-
-  async function handleCreateSchema() {
-    setLoadingSchema(true)
-    try {
-      const result = await apiCall('/api/databricks/create-schema', {
-        method: 'POST',
-        body: JSON.stringify({ catalog: catalogName, name: targetSchema }),
-      })
-      addToast(`Schema "${result.full_name}" created successfully`, 'success')
-    } catch (e: any) {
-      addToast(`Failed to create schema: ${e.message}`, 'error')
-    } finally {
-      setLoadingSchema(false)
-    }
-  }
-
-  async function handleCreateVolume() {
-    setLoadingVolume(true)
-    try {
-      const result = await apiCall('/api/databricks/create-volume', {
-        method: 'POST',
-        body: JSON.stringify({ catalog: catalogName, schema_name: targetSchema, name: 'libs' }),
-      })
-      addToast(`Volume "${result.full_name}" created successfully`, 'success')
-    } catch (e: any) {
-      addToast(`Failed to create volume: ${e.message}`, 'error')
-    } finally {
-      setLoadingVolume(false)
-    }
-  }
 
   // ── Job Actions ──────────────────────────────────────────────────────────
 
@@ -434,45 +468,134 @@ export default function DatabricksTab() {
         <Toast key={t.id} message={t.message} type={t.type} onClose={() => removeToast(t.id)} />
       ))}
 
-      {/* Setup Section */}
-      <Section title="1. Setup - Create Catalog & Storage" defaultOpen={true}>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-4">
-          <FormField label="Catalog Name">
-            <TextInput value={catalogName} onChange={setCatalogName} placeholder="gcp_tpcdi_classic" />
-          </FormField>
-          <FormField label="Root Storage Location">
-            <TextInput value={storageRoot} onChange={setStorageRoot} placeholder="gs://bucket/path" />
-          </FormField>
-          <FormField label="GCP Service Account Email">
-            <TextInput value={saEmail} onChange={setSaEmail} placeholder="sa-name@project.iam.gserviceaccount.com" />
-          </FormField>
-          <div className="md:col-span-2">
-            <FormField label="GCP Service Account Key (JSON)" hint="Paste the full SA key JSON content">
-              <TextArea
-                value={saKeyJson}
-                onChange={setSaKeyJson}
-                placeholder='{"type": "service_account", "project_id": "...", ...}'
-                rows={5}
-              />
+      {/* Prerequisites Section */}
+      <Section title="1. Create & Verify Prerequisites" defaultOpen={true} colorScheme="emerald">
+        <div className="pt-4">
+          {/* Status check results */}
+          {prereqCheck && (
+            <div className={`mb-4 p-4 rounded-lg border ${prereqCheck.status === 'ready' ? 'bg-green-50 border-green-200' : 'bg-amber-50 border-amber-200'}`}>
+              <div className="flex items-center justify-between mb-3">
+                <h4 className={`text-sm font-semibold ${prereqCheck.status === 'ready' ? 'text-green-700' : 'text-amber-700'}`}>
+                  {prereqCheck.status === 'ready' ? 'All prerequisites ready' : 'Some prerequisites missing'}
+                </h4>
+                <button
+                  onClick={() => checkPrerequisites()}
+                  disabled={loadingPrereqCheck}
+                  className="text-xs text-slate-500 hover:text-slate-700 disabled:opacity-50"
+                >
+                  {loadingPrereqCheck ? 'Checking...' : 'Re-check'}
+                </button>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
+                {Object.entries(prereqCheck.resources).map(([key, res]) => (
+                  <div key={key} className="flex items-start gap-2">
+                    <span className={`mt-0.5 w-4 h-4 rounded-full flex items-center justify-center text-[10px] font-bold ${res.exists ? 'bg-green-500 text-white' : 'bg-slate-300 text-white'}`}>
+                      {res.exists ? '\u2713' : '\u00d7'}
+                    </span>
+                    <div>
+                      <p className="text-xs font-medium text-slate-700 capitalize">{key.replace('_', ' ')}</p>
+                      <p className="text-[10px] text-slate-500 font-mono truncate max-w-[140px]" title={res.name}>{res.name}</p>
+                      {res.sa_email && <p className="text-[10px] text-slate-400 truncate max-w-[140px]" title={res.sa_email}>{res.sa_email}</p>}
+                      {res.url && <p className="text-[10px] text-slate-400 truncate max-w-[140px]" title={res.url}>{res.url}</p>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Config inputs */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <FormField label="Raw Data Path (GCS)">
+              <TextInput value={rawDataPath} onChange={setRawDataPath} placeholder="gs://bucket/tpcdi" />
             </FormField>
           </div>
-        </div>
 
-        <div className="flex flex-wrap gap-3 mt-5 pt-4 border-t border-slate-100">
-          <ActionButton label="Create Storage Credential" onClick={handleCreateCredential} loading={loadingCred} />
-          <ActionButton label="Create Catalog" onClick={handleCreateCatalog} loading={loadingCatalog} />
-          <ActionButton
-            label="Create External Location"
-            onClick={handleCreateExternalLocation}
-            loading={loadingExtLoc}
-          />
-          <ActionButton label="Create Schema" onClick={handleCreateSchema} loading={loadingSchema} variant="secondary" />
-          <ActionButton label="Create Volume" onClick={handleCreateVolume} loading={loadingVolume} variant="secondary" />
+          {/* Create & Verify button */}
+          <div className="flex flex-wrap gap-3 mt-5 pt-4 border-t border-slate-100">
+            <ActionButton
+              label="Create & Verify Prerequisites"
+              onClick={handleCreatePrerequisites}
+              loading={loadingPrereqCreate}
+            />
+            <ActionButton
+              label="Check Status"
+              onClick={() => checkPrerequisites()}
+              loading={loadingPrereqCheck}
+              variant="secondary"
+            />
+          </div>
+
+          {/* Step-by-step results from create */}
+          {prereqResult && (
+            <div className="mt-4 border border-slate-200 rounded-lg overflow-hidden">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="bg-slate-50 text-left text-slate-500 uppercase tracking-wide">
+                    <th className="px-3 py-2">Resource</th>
+                    <th className="px-3 py-2">Name</th>
+                    <th className="px-3 py-2">Status</th>
+                    <th className="px-3 py-2">Details</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {prereqResult.steps.map((s, i) => (
+                    <tr key={i} className="border-t border-slate-100">
+                      <td className="px-3 py-2 font-medium text-slate-700 capitalize">{s.step.replace('_', ' ')}</td>
+                      <td className="px-3 py-2 font-mono text-slate-600">{s.name}</td>
+                      <td className="px-3 py-2">
+                        <span className={`inline-block px-2 py-0.5 rounded text-[10px] font-medium ${
+                          s.status === 'exists' ? 'bg-green-100 text-green-700' :
+                          s.status === 'created' ? 'bg-blue-100 text-blue-700' :
+                          s.status === 'missing' ? 'bg-amber-100 text-amber-700' :
+                          'bg-red-100 text-red-700'
+                        }`}>
+                          {s.status.toUpperCase()}
+                        </span>
+                      </td>
+                      <td className="px-3 py-2 text-slate-500 max-w-xs truncate">
+                        {s.error || s.sa_email || s.url || '--'}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {/* Summary */}
+              {prereqResult.summary && prereqResult.status === 'ready' && (
+                <div className="bg-green-50 px-4 py-3 border-t border-slate-200">
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs">
+                    <div>
+                      <span className="text-slate-500">Catalog:</span>{' '}
+                      <span className="font-mono font-medium text-slate-700">{prereqResult.summary.catalog}</span>
+                    </div>
+                    <div>
+                      <span className="text-slate-500">SA Email:</span>{' '}
+                      <span className="font-mono font-medium text-slate-700 truncate">{prereqResult.summary.sa_email || '--'}</span>
+                    </div>
+                    <div>
+                      <span className="text-slate-500">External Location:</span>{' '}
+                      <span className="font-mono font-medium text-slate-700">{prereqResult.summary.external_location}</span>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </Section>
 
-      {/* Benchmark Configuration Section */}
-      <Section title="2. Benchmark Configuration">
+      {/* Benchmark Configuration Section - visible only when prerequisites are ready */}
+      {prereqCheck?.status === 'ready' && (
+      <Section title="2. Benchmark Configuration" colorScheme="amber">
+        {/* Sizing Suggestion Banner */}
+        {sizingConfig && (
+          <div className="mt-4 p-3 bg-amber-50 border border-amber-200 rounded-lg">
+            <p className="text-sm text-amber-800">
+              <span className="font-semibold">Auto-sized for {loadType} SF={scaleFactor} ({sizingConfig.label}):</span>{' '}
+              Driver <span className="font-mono">{sizingConfig.driver}</span>, Worker <span className="font-mono">{sizingConfig.worker}</span>, {sizingConfig.workers} workers
+            </p>
+          </div>
+        )}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 pt-4">
           <FormField label="Load Type">
             <SelectInput
@@ -492,7 +615,6 @@ export default function DatabricksTab() {
                 { value: '10', label: '10' },
                 { value: '100', label: '100' },
                 { value: '1000', label: '1000' },
-                { value: '5000', label: '5000' },
                 { value: '10000', label: '10000' },
               ]}
             />
@@ -509,11 +631,11 @@ export default function DatabricksTab() {
               />
             </FormField>
           )}
-          <FormField label="Raw Data Path">
-            <TextInput value={rawDataPath} onChange={setRawDataPath} placeholder="gs://bucket/tpcdi" />
+          <FormField label="Target Catalog" hint="Set in Prerequisites">
+            <div className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-md text-sm font-mono text-slate-700">{targetCatalog}</div>
           </FormField>
-          <FormField label="Target Catalog">
-            <TextInput value={targetCatalog} onChange={setTargetCatalog} placeholder="gcp_tpcdi_classic" />
+          <FormField label="Raw Data Path" hint="Set in Prerequisites">
+            <div className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-md text-sm font-mono text-slate-700 truncate" title={rawDataPath}>{rawDataPath}</div>
           </FormField>
           <FormField label="Target Schema">
             <TextInput value={targetSchema} onChange={setTargetSchema} placeholder="dw" />
@@ -573,19 +695,12 @@ export default function DatabricksTab() {
           </div>
         </div>
 
-        {/* Sizing Suggestion */}
-        {sizingSuggestion && (
-          <div className="mt-4 p-3 bg-amber-50 border border-amber-200 rounded-lg">
-            <p className="text-sm text-amber-800">
-              <span className="font-semibold">Sizing suggestion for {loadType} SF={scaleFactor}:</span>{' '}
-              {sizingSuggestion}
-            </p>
-          </div>
-        )}
       </Section>
+      )}
 
-      {/* Run Section */}
-      <Section title="3. Run Benchmark" defaultOpen={true}>
+      {/* Run Section - visible only when prerequisites are ready */}
+      {prereqCheck?.status === 'ready' && (
+      <Section title="3. Run Benchmark" defaultOpen={true} colorScheme="blue">
         <div className="pt-4">
           {/* Job selector / loader */}
           <div className="flex flex-wrap gap-3 items-center mb-4">
@@ -611,37 +726,84 @@ export default function DatabricksTab() {
             )}
           </div>
 
-          {/* Load existing job */}
-          {!jobId && (
-            <div className="mb-4 p-3 bg-slate-50 rounded-lg border border-slate-200">
-              <p className="text-xs text-slate-500 mb-2">Load an existing job by ID or select from recent jobs:</p>
-              <div className="flex gap-2 items-center mb-2">
-                <input
-                  type="text"
-                  value={manualJobId}
-                  onChange={(e) => setManualJobId(e.target.value)}
-                  placeholder="Enter Job ID"
-                  className="border border-slate-300 rounded-md px-3 py-1.5 text-sm w-48 focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent"
-                  onKeyDown={(e) => e.key === 'Enter' && handleLoadJobId()}
-                />
-                <ActionButton label="Load" onClick={handleLoadJobId} variant="secondary" />
-              </div>
-              {availableJobs.length > 0 && (
-                <div className="flex flex-wrap gap-2">
-                  {availableJobs.map((j) => (
-                    <button
-                      key={j.job_id}
-                      onClick={() => setJobId(j.job_id)}
-                      className="text-xs px-3 py-1.5 bg-white border border-slate-200 rounded-md hover:bg-orange-50 hover:border-orange-300 transition-colors"
-                    >
-                      <span className="font-mono text-orange-600">{j.job_id}</span>
-                      <span className="text-slate-500 ml-1.5">{j.name}</span>
-                    </button>
-                  ))}
-                </div>
-              )}
+          {/* Benchmark Jobs List - always visible */}
+          <div className="mb-4">
+            <div className="flex items-center justify-between mb-2">
+              <h4 className="text-sm font-semibold text-slate-700">Benchmark Jobs</h4>
+              <button
+                onClick={loadAvailableJobs}
+                disabled={loadingJobs}
+                className="text-xs text-orange-600 hover:text-orange-700 disabled:opacity-50"
+              >
+                {loadingJobs ? 'Loading...' : 'Refresh'}
+              </button>
             </div>
-          )}
+            {/* Manual job ID input */}
+            <div className="flex gap-2 items-center mb-3">
+              <input
+                type="text"
+                value={manualJobId}
+                onChange={(e) => setManualJobId(e.target.value)}
+                placeholder="Enter Job ID manually"
+                className="border border-slate-300 rounded-md px-3 py-1.5 text-sm w-48 focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent"
+                onKeyDown={(e) => e.key === 'Enter' && handleLoadJobId()}
+              />
+              <ActionButton label="Load" onClick={handleLoadJobId} variant="secondary" />
+            </div>
+            {availableJobs.length > 0 ? (
+              <div className="border border-slate-200 rounded-lg overflow-hidden">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="bg-slate-50 text-left text-slate-500 uppercase tracking-wide">
+                      <th className="px-3 py-2">Job ID</th>
+                      <th className="px-3 py-2">Name</th>
+                      <th className="px-3 py-2">Latest Run</th>
+                      <th className="px-3 py-2">Last Run Time</th>
+                      <th className="px-3 py-2">Duration</th>
+                      <th className="px-3 py-2"></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {availableJobs.map((j) => (
+                      <tr
+                        key={j.job_id}
+                        className={`border-t border-slate-100 hover:bg-slate-50 cursor-pointer ${j.job_id === jobId ? 'bg-orange-50 border-l-2 border-l-orange-400' : ''}`}
+                        onClick={() => setJobId(j.job_id)}
+                      >
+                        <td className="px-3 py-2 font-mono text-orange-600">{j.job_id}</td>
+                        <td className="px-3 py-2 text-slate-700 font-medium">{j.name}</td>
+                        <td className="px-3 py-2">
+                          {j.latest_run ? (
+                            <span className={`inline-block px-2 py-0.5 rounded text-[10px] font-medium ${stateColor(j.latest_run.state, j.latest_run.result_state)}`}>
+                              {stateLabel(j.latest_run.state, j.latest_run.result_state)}
+                            </span>
+                          ) : (
+                            <span className="text-slate-400">No runs</span>
+                          )}
+                        </td>
+                        <td className="px-3 py-2 text-slate-500">
+                          {j.latest_run ? formatTimestamp(j.latest_run.start_time) : '--'}
+                        </td>
+                        <td className="px-3 py-2 font-mono">
+                          {j.latest_run ? formatDuration(j.latest_run.execution_duration) : '--'}
+                        </td>
+                        <td className="px-3 py-2">
+                          <button
+                            onClick={(e) => { e.stopPropagation(); setJobId(j.job_id) }}
+                            className={`text-xs px-2 py-1 rounded ${j.job_id === jobId ? 'bg-orange-100 text-orange-700' : 'bg-slate-100 text-slate-600 hover:bg-orange-50 hover:text-orange-600'}`}
+                          >
+                            {j.job_id === jobId ? 'Selected' : 'Select'}
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : !loadingJobs ? (
+              <p className="text-sm text-slate-400">No benchmark jobs found. Create one above.</p>
+            ) : null}
+          </div>
 
           {/* Current Run Status */}
           {jobStatus && runId && (
@@ -759,6 +921,7 @@ export default function DatabricksTab() {
           )}
         </div>
       </Section>
+      )}
     </div>
   )
 }
