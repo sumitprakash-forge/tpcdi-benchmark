@@ -72,21 +72,35 @@ ENV_LOCAL_GEN_PATH = "TPCDI_LOCAL_GEN_PATH"
 
 def _repo_root() -> Path:
     """Infer repo root (script location or workspace). When in tpcdi/, use parent so tools/datagen is found."""
+    # Prefer __file__ when available (works whether on Databricks or not)
+    try:
+        script_dir = Path(__file__).resolve().parent
+        # If this script lives in tpcdi/, tools/datagen is at project root (parent of tpcdi)
+        parent = script_dir.parent
+        if (parent / "tools" / "datagen").exists():
+            return parent
+        if (script_dir / "tools" / "datagen").exists():
+            return script_dir
+    except NameError:
+        pass
+    # Fallback: use notebook workspace path on Databricks
     if IN_DATABRICKS and dbutils:
         try:
             ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
-            ws = ctx.workspacePath().get()
-            if ws:
-                return Path(ws)
+            nb_path = ctx.notebookPath().get()
+            # Ensure /Workspace prefix for filesystem access
+            if nb_path and not nb_path.startswith("/Workspace"):
+                nb_path = "/Workspace" + nb_path
+            if nb_path:
+                ws = Path(nb_path).parent  # notebook dir (e.g. .../databricks/)
+                parent = ws.parent          # project root (e.g. .../tpcdi-benchmark/)
+                if (parent / "tools" / "datagen").exists():
+                    return parent
+                return ws
         except Exception:
             pass
         return Path.cwd()
-    script_dir = Path(__file__).resolve().parent
-    # If this script lives in tpcdi/, tools/datagen is at project root (parent of tpcdi)
-    parent = script_dir.parent
-    if (parent / "tools" / "datagen").exists():
-        return parent
-    return script_dir
+    return Path.cwd()
 
 
 def _default_digen_path() -> Path:
@@ -109,8 +123,35 @@ def _copy_directory(src: Path, dst: Path, overwrite: bool = True) -> None:
         shutil.copytree(src, dst)
 
 
+def _ensure_local_digen(digen_path: Path) -> Path:
+    """Copy DIGen to a local temp dir if running from /Workspace FUSE mount.
+
+    Java has issues running jars from the Databricks /Workspace FUSE filesystem.
+    Copy to /tmp/tpcdi_digen/ so Java can read the jar and pdgf/ normally.
+    """
+    digen_str = str(digen_path)
+    if not digen_str.startswith("/Workspace"):
+        return digen_path
+    local_digen = Path("/tmp/tpcdi_digen")
+    # Copy if not already there or if source is newer
+    jar_src = digen_path / "DIGen.jar"
+    jar_dst = local_digen / "DIGen.jar"
+    if jar_dst.exists() and jar_dst.stat().st_size == jar_src.stat().st_size:
+        print(f"Using cached local DIGen at {local_digen}")
+        return local_digen
+    print(f"Copying DIGen from {digen_path} to {local_digen} (FUSE workaround)...")
+    if local_digen.exists():
+        shutil.rmtree(local_digen)
+    shutil.copytree(str(digen_path), str(local_digen))
+    print(f"Copied DIGen ({sum(1 for _ in local_digen.rglob('*'))} files)")
+    return local_digen
+
+
 def _run_digen(digen_path: Path, scale_factor: int, output_path: Path) -> None:
     """Run DIGen.jar. Sets PDG_AGREE=YES to accept EULA automatically."""
+    # Copy to local filesystem if on /Workspace FUSE mount
+    digen_path = _ensure_local_digen(digen_path)
+
     jar = digen_path / "DIGen.jar"
     if not jar.exists():
         raise FileNotFoundError(
@@ -125,30 +166,56 @@ def _run_digen(digen_path: Path, scale_factor: int, output_path: Path) -> None:
         )
 
     output_path.mkdir(parents=True, exist_ok=True)
+
+    # Diagnostics
+    print(f"DIGen path: {digen_path}")
+    print(f"JAR exists: {jar.exists()}, size: {jar.stat().st_size if jar.exists() else 'N/A'}")
+    print(f"pdgf exists: {pdgf.is_dir()}")
+    print(f"Output path: {output_path}, exists: {output_path.exists()}")
+    try:
+        java_ver = subprocess.run(["java", "-version"], capture_output=True, text=True)
+        print(f"Java version: {(java_ver.stderr or java_ver.stdout).strip()[:200]}")
+    except Exception as e:
+        print(f"Java check failed: {e}")
+
     cmd = f"java -jar {jar} -sf {scale_factor} -o {output_path}"
     args = shlex.split(cmd)
-    
+
     # Set PDG_AGREE=YES to automatically accept EULA
     env = os.environ.copy()
     env['PDG_AGREE'] = 'YES'
-    
+
+    print(f"Running: {cmd}")
     proc = subprocess.Popen(
         args,
         cwd=str(digen_path),
         env=env,
         universal_newlines=True,
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stderr=subprocess.PIPE,
     )
 
+    stdout_lines = []
+    stderr_lines = []
     if proc.stdout:
         for line in iter(proc.stdout.readline, ""):
             line = line.rstrip()
             if line:
-                print(line)
+                print(f"[DIGen stdout] {line}")
+                stdout_lines.append(line)
+    if proc.stderr:
+        for line in iter(proc.stderr.readline, ""):
+            line = line.rstrip()
+            if line:
+                print(f"[DIGen stderr] {line}")
+                stderr_lines.append(line)
     proc.wait()
     if proc.returncode != 0:
-        raise RuntimeError(f"DIGen exited with code {proc.returncode}")
+        all_output = "\n".join(stdout_lines + stderr_lines)
+        raise RuntimeError(
+            f"DIGen exited with code {proc.returncode}.\n"
+            f"Output:\n{all_output[-2000:]}"
+        )
 
 
 def _copy_file_to_dbfs(src: Path, dest: Path) -> str:

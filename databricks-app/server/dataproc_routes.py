@@ -13,6 +13,8 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
+import google.auth.transport.requests
+
 from server.gcp_auth import (
     get_auth_status,
     get_credentials,
@@ -115,6 +117,8 @@ class DataprocPrereqRequest(BaseModel):
     region: str = "us-central1"
     subnet: str = "tpcdi-benchmark-subnet"
     gcs_bucket: str = "sumit_prakash_gcs"
+    metastore_mode: str = "spark_default"  # "spark_default", "create", "existing"
+    metastore_name: str = "tpcdi-benchmark-metastore"
 
 
 class DataprocFullRunRequest(BaseModel):
@@ -505,6 +509,107 @@ async def verify_prerequisites(req: DataprocPrereqRequest):
             steps.append({"step": "gcs_bucket", "name": f"gs://{req.gcs_bucket}",
                            "status": "error", "error": str(e)})
             overall_ok = False
+
+    # ── Step 6 (optional): Dataproc Metastore ─────────────────────────────
+    if req.metastore_mode == "create":
+        metastore_service_id = req.metastore_name
+        metastore_full_name = f"projects/{req.project}/locations/{req.region}/services/{metastore_service_id}"
+        try:
+            # Check if metastore already exists
+            import requests as http_requests
+            token = creds.token
+            if not token:
+                creds.refresh(google.auth.transport.requests.Request())
+                token = creds.token
+            ms_url = f"https://metastore.googleapis.com/v1/{metastore_full_name}"
+            ms_resp = http_requests.get(ms_url, headers={"Authorization": f"Bearer {token}"})
+            if ms_resp.status_code == 200:
+                ms_data = ms_resp.json()
+                ms_state = ms_data.get("state", "UNKNOWN")
+                ms_network = ms_data.get("network", "")
+                # Check if metastore is on the same VPC
+                expected_vpc = f"projects/{req.project}/global/networks/{vpc_name}"
+                if ms_network and expected_vpc not in ms_network:
+                    steps.append({"step": "metastore", "name": metastore_service_id,
+                                   "status": "warning",
+                                   "error": f"Metastore exists but on different network ({ms_network}). Expected {expected_vpc}. Cluster creation may fail."})
+                else:
+                    steps.append({"step": "metastore", "name": metastore_service_id,
+                                   "status": "exists", "state": ms_state,
+                                   "full_name": metastore_full_name})
+            elif ms_resp.status_code == 404:
+                # Create the metastore
+                if not vpc_self_link:
+                    steps.append({"step": "metastore", "name": metastore_service_id,
+                                   "status": "error", "error": "Cannot create metastore: VPC not available"})
+                    overall_ok = False
+                else:
+                    create_url = f"https://metastore.googleapis.com/v1/projects/{req.project}/locations/{req.region}/services?serviceId={metastore_service_id}"
+                    create_body = {
+                        "hiveMetastoreConfig": {
+                            "version": "3.1.2",
+                        },
+                        "network": f"projects/{req.project}/global/networks/{vpc_name}",
+                        "port": 9083,
+                        "tier": "DEVELOPER",
+                    }
+                    create_resp = http_requests.post(
+                        create_url,
+                        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                        json=create_body,
+                    )
+                    if create_resp.status_code in (200, 201):
+                        op_data = create_resp.json()
+                        op_name = op_data.get("name", "")
+                        # Poll the operation (metastore creation can take several minutes)
+                        steps.append({"step": "metastore", "name": metastore_service_id,
+                                       "status": "creating",
+                                       "full_name": metastore_full_name,
+                                       "operation": op_name,
+                                       "message": "Metastore creation started (takes 5-10 min). It will be ready before cluster needs it."})
+                        # Poll for up to 10 minutes
+                        for _poll in range(60):
+                            await asyncio.sleep(10)
+                            poll_resp = http_requests.get(
+                                f"https://metastore.googleapis.com/v1/{op_name}",
+                                headers={"Authorization": f"Bearer {token}"},
+                            )
+                            if poll_resp.status_code == 200:
+                                poll_data = poll_resp.json()
+                                if poll_data.get("done"):
+                                    if "error" in poll_data:
+                                        err_msg = poll_data["error"].get("message", str(poll_data["error"]))
+                                        steps[-1] = {"step": "metastore", "name": metastore_service_id,
+                                                      "status": "error", "error": err_msg}
+                                        overall_ok = False
+                                    else:
+                                        steps[-1] = {"step": "metastore", "name": metastore_service_id,
+                                                      "status": "created", "full_name": metastore_full_name}
+                                    break
+                        else:
+                            # Timed out waiting
+                            steps[-1] = {"step": "metastore", "name": metastore_service_id,
+                                          "status": "creating_timeout",
+                                          "full_name": metastore_full_name,
+                                          "message": "Metastore still creating after 10 min. Check GCP console."}
+                            overall_ok = False
+                    else:
+                        steps.append({"step": "metastore", "name": metastore_service_id,
+                                       "status": "error",
+                                       "error": f"Create failed ({create_resp.status_code}): {create_resp.text[:300]}"})
+                        overall_ok = False
+            else:
+                steps.append({"step": "metastore", "name": metastore_service_id,
+                               "status": "error",
+                               "error": f"Check failed ({ms_resp.status_code}): {ms_resp.text[:300]}"})
+                overall_ok = False
+        except Exception as e:
+            steps.append({"step": "metastore", "name": metastore_service_id,
+                           "status": "error", "error": str(e)[:500]})
+            overall_ok = False
+    elif req.metastore_mode == "spark_default":
+        steps.append({"step": "metastore", "name": "Spark Default",
+                       "status": "skipped", "message": "Using Spark's built-in Derby metastore (no external Hive metastore)"})
 
     return {
         "status": "ready" if overall_ok else "incomplete",

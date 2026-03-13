@@ -525,7 +525,86 @@ async def verify_prerequisites(req: PrerequisitesRequest, request: Request):
             except Exception as e:
                 steps.append({"step": "volume", "name": vol_full, "status": "error", "error": str(e)})
 
+        # 5. GCS bucket write access for compute SA (needed for datagen upload)
+        gcs_bucket = ""
+        compute_sa = ""
+        try:
+            gcs_parts = req.raw_data_path.replace("gs://", "").split("/")
+            gcs_bucket = gcs_parts[0]
+            if gcs_bucket:
+                # Get the workspace's default compute SA via cluster API
+                # On GCP Databricks, the compute SA is typically in the workspace config
+                try:
+                    # Try to get it from a recent cluster or workspace config
+                    resp = w.api_client.do("GET", "/api/2.0/clusters/list")
+                    for cl in (resp or {}).get("clusters", []):
+                        gcp_attrs = cl.get("gcp_attributes", {})
+                        sa = gcp_attrs.get("google_service_account", "")
+                        if sa:
+                            compute_sa = sa
+                            break
+                except Exception:
+                    pass
+
+                # Fallback: try workspace config API for default SA
+                if not compute_sa:
+                    try:
+                        # The default compute SA follows the pattern: databricks-compute@<project>.iam.gserviceaccount.com
+                        # Try to get from credential config
+                        resp = w.api_client.do("GET", "/api/2.0/workspace-conf", data={"keys": "googleServiceAccount"})
+                        compute_sa = (resp or {}).get("googleServiceAccount", "")
+                    except Exception:
+                        pass
+
+                if compute_sa:
+                    # Check if SA already has write access to the GCS bucket
+                    from server.gcp_auth import get_credentials
+                    creds = get_credentials()
+                    if creds:
+                        from googleapiclient.discovery import build
+                        storage = build("storage", "v1", credentials=creds)
+                        policy = storage.buckets().getIamPolicy(bucket=gcs_bucket).execute()
+                        member = f"serviceAccount:{compute_sa}"
+                        has_write = False
+                        write_roles = {"roles/storage.admin", "roles/storage.objectAdmin", "roles/storage.objectCreator"}
+                        for binding in policy.get("bindings", []):
+                            if binding.get("role") in write_roles and member in binding.get("members", []):
+                                has_write = True
+                                break
+                        if has_write:
+                            steps.append({"step": "gcs_compute_sa", "name": f"{compute_sa} → gs://{gcs_bucket}", "status": "exists"})
+                        else:
+                            # Grant objectAdmin to the compute SA
+                            role_to_grant = "roles/storage.objectAdmin"
+                            bindings = policy.get("bindings", [])
+                            role_binding = None
+                            for b in bindings:
+                                if b.get("role") == role_to_grant:
+                                    role_binding = b
+                                    break
+                            if role_binding:
+                                role_binding["members"].append(member)
+                            else:
+                                bindings.append({"role": role_to_grant, "members": [member]})
+                            policy["bindings"] = bindings
+                            storage.buckets().setIamPolicy(bucket=gcs_bucket, body=policy).execute()
+                            steps.append({"step": "gcs_compute_sa", "name": f"{compute_sa} → gs://{gcs_bucket}", "status": "created"})
+                    else:
+                        steps.append({"step": "gcs_compute_sa", "name": f"{compute_sa} → gs://{gcs_bucket}",
+                                      "status": "skipped", "error": "GCP auth not available. Sign in on Dataproc tab first."})
+                else:
+                    steps.append({"step": "gcs_compute_sa", "name": f"gs://{gcs_bucket}",
+                                  "status": "skipped", "error": "Could not determine compute SA. Grant access manually."})
+        except Exception as e:
+            sa_display = f"{compute_sa} → gs://{gcs_bucket}" if compute_sa and gcs_bucket else f"gs://{gcs_bucket}"
+            steps.append({"step": "gcs_compute_sa", "name": sa_display, "status": "skipped", "error": str(e)})
+
         all_ok = all(s.get("status") in ("exists", "created", "skipped") for s in steps)
+        sa_email_summary = ""
+        for s in steps:
+            if s.get("step") == "gcs_compute_sa" and s.get("name"):
+                sa_email_summary = s["name"].split(" → ")[0] if " → " in s["name"] else ""
+                break
         return {
             "status": "ready" if all_ok else "incomplete",
             "steps": steps,
@@ -534,6 +613,7 @@ async def verify_prerequisites(req: PrerequisitesRequest, request: Request):
                 "external_location": ext_loc_name,
                 "external_location_url": ext_loc_url,
                 "volume": vol_full,
+                "sa_email": sa_email_summary,
             },
         }
 

@@ -92,22 +92,33 @@ from pathlib import Path
 # Ensure project root is on path (notebook in databricks/ → repo root = parent; else notebook dir)
 try:
     notebook_path = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()
-    workspace_path = Path(notebook_path).parent
-    # Repo may be repo/tpcdi/databricks (then parent of databricks = tpcdi) or repo/databricks (then parent = repo)
-    parent = workspace_path.parent
-    if (parent / "tpcdi").is_dir():
+    # Ensure /Workspace prefix for filesystem access (notebookPath may return /Users/... without it)
+    if not notebook_path.startswith("/Workspace"):
+        notebook_path = "/Workspace" + notebook_path
+    workspace_path = Path(notebook_path).parent  # .../tpcdi-benchmark/databricks/
+    parent = workspace_path.parent               # .../tpcdi-benchmark/
+    print(f"[path-debug] notebook_path={notebook_path}")
+    print(f"[path-debug] parent={parent} exists={os.path.isdir(str(parent))}")
+    print(f"[path-debug] parent/benchmark exists={os.path.isdir(str(parent / 'benchmark'))}")
+    print(f"[path-debug] parent/generate_tpcdi_data.py exists={os.path.isfile(str(parent / 'generate_tpcdi_data.py'))}")
+    if os.path.isdir(str(parent / "tpcdi")):
         project_root = parent  # repo root (has tpcdi/)
-    elif (parent / "benchmark").is_dir():
+    elif os.path.isdir(str(parent / "benchmark")):
         project_root = parent  # tpcdi dir (has benchmark/)
     else:
         project_root = workspace_path
-except Exception:
+except Exception as _path_err:
+    print(f"[path-debug] Exception: {_path_err}")
     project_root = Path(os.getcwd())
-sys.path.insert(0, str(project_root.resolve()))
+print(f"[path-debug] project_root={project_root}")
+# Add project root to sys.path
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
 # When repo root is on path, add tpcdi dir so "import generate_tpcdi_data" finds tpcdi/generate_tpcdi_data.py
-_tpcdi_dir = project_root / "tpcdi" if (project_root / "tpcdi").is_dir() else project_root
-if str(_tpcdi_dir.resolve()) not in sys.path:
-    sys.path.insert(0, str(_tpcdi_dir.resolve()))
+_tpcdi_dir = project_root / "tpcdi" if os.path.isdir(str(project_root / "tpcdi")) else project_root
+if str(_tpcdi_dir) not in sys.path:
+    sys.path.insert(0, str(_tpcdi_dir))
+print(f"[path-debug] sys.path[:5]={sys.path[:5]}")
 
 # Import and reload to pick up any code changes (works whether path has tpcdi/ or repo root)
 try:

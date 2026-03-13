@@ -120,7 +120,9 @@ export default function DataprocTab() {
   const [region, setRegion] = useState('us-central1')
   const [zone, setZone] = useState('us-central1-a')
   const [subnet, setSubnet] = useState('tpcdi-benchmark-subnet')
-  const [metastore, setMetastore] = useState('projects/gcp-sandbox-field-eng/locations/us-central1/services/sumit-bnchmark-metastore')
+  const [metastoreMode, setMetastoreMode] = useState<'spark_default' | 'create' | 'existing'>('spark_default')
+  const [metastore, setMetastore] = useState('')
+  const [metastoreName, setMetastoreName] = useState('tpcdi-benchmark-metastore')
   const [gcsBucket, setGcsBucket] = useState('sumit_prakash_gcs')
   const [rawDataPath, setRawDataPath] = useState('gs://sumit_prakash_gcs/tpcdi')
   const [targetDatabase, setTargetDatabase] = useState('tpcdi_warehouse')
@@ -298,7 +300,8 @@ export default function DataprocTab() {
         method: 'POST',
         body: JSON.stringify({
           cluster_name: clName,
-          project, region, zone, subnet, metastore,
+          project, region, zone, subnet,
+          metastore: metastoreMode === 'existing' ? metastore : (metastoreMode === 'create' ? `projects/${project}/locations/${region}/services/${metastoreName}` : ''),
           image_version: '2.3-debian12',
           master_type: sizing.master,
           worker_type: sizing.worker,
@@ -479,7 +482,11 @@ export default function DataprocTab() {
 
       const prereqs = await apiCall('/api/dataproc/verify-prerequisites', {
         method: 'POST',
-        body: JSON.stringify({ project, region, subnet, gcs_bucket: gcsBucket }),
+        body: JSON.stringify({
+          project, region, subnet, gcs_bucket: gcsBucket,
+          metastore_mode: metastoreMode,
+          metastore_name: metastoreName,
+        }),
       })
 
       const prereqDetails = (prereqs.steps || []).map((s: any) => ({
@@ -825,10 +832,12 @@ export default function DataprocTab() {
                           <span className={`mt-0.5 w-4 h-4 rounded-full flex items-center justify-center text-[9px] font-bold flex-shrink-0 ${
                             d.status === 'created' ? 'bg-blue-500 text-white' :
                             d.status === 'exists' ? 'bg-green-500 text-white' :
-                            d.status === 'skipped' ? 'bg-yellow-500 text-white' :
+                            d.status === 'skipped' ? 'bg-slate-400 text-white' :
+                            d.status === 'warning' ? 'bg-amber-500 text-white' :
+                            d.status === 'creating' ? 'bg-blue-400 text-white animate-pulse' :
                             'bg-red-400 text-white'
                           }`}>
-                            {d.status === 'exists' ? '\u2713' : d.status === 'created' ? '+' : d.status === 'skipped' ? '\u2013' : '\u00d7'}
+                            {d.status === 'exists' ? '\u2713' : d.status === 'created' ? '+' : d.status === 'skipped' ? '\u2013' : d.status === 'warning' ? '!' : d.status === 'creating' ? '\u2026' : '\u00d7'}
                           </span>
                           <div className="min-w-0">
                             <p className="text-[11px] font-medium text-slate-700 capitalize">{d.label}</p>
@@ -837,7 +846,9 @@ export default function DataprocTab() {
                               <span className={`inline-block mt-0.5 text-[9px] font-medium px-1.5 py-0.5 rounded ${
                                 d.status === 'created' ? 'bg-blue-100 text-blue-700' :
                                 d.status === 'error' ? 'bg-red-100 text-red-700' :
-                                d.status === 'skipped' ? 'bg-yellow-100 text-yellow-700' :
+                                d.status === 'skipped' ? 'bg-slate-100 text-slate-600' :
+                                d.status === 'warning' ? 'bg-amber-100 text-amber-700' :
+                                d.status === 'creating' ? 'bg-blue-100 text-blue-600' :
                                 'bg-slate-100 text-slate-600'
                               }`}>{d.status}</span>
                             )}
@@ -971,9 +982,27 @@ export default function DataprocTab() {
                 <FormField label="GCS Bucket">
                   <TextInput value={gcsBucket} onChange={setGcsBucket} placeholder="my-bucket" />
                 </FormField>
-                <FormField label="Metastore">
-                  <TextInput value={metastore} onChange={setMetastore} placeholder="projects/.../services/..." />
+                <FormField label="Hive Metastore">
+                  <SelectInput
+                    value={metastoreMode}
+                    onChange={(v) => setMetastoreMode(v as 'spark_default' | 'create' | 'existing')}
+                    options={[
+                      { value: 'spark_default', label: 'Spark Default (no external metastore)' },
+                      { value: 'create', label: 'Create Dataproc Metastore' },
+                      { value: 'existing', label: 'Use Existing Metastore' },
+                    ]}
+                  />
                 </FormField>
+                {metastoreMode === 'create' && (
+                  <FormField label="Metastore Name">
+                    <TextInput value={metastoreName} onChange={setMetastoreName} placeholder="tpcdi-benchmark-metastore" />
+                  </FormField>
+                )}
+                {metastoreMode === 'existing' && (
+                  <FormField label="Metastore Service Path">
+                    <TextInput value={metastore} onChange={setMetastore} placeholder="projects/.../locations/.../services/..." />
+                  </FormField>
+                )}
               </div>
 
               {/* Cluster Config */}
