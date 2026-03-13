@@ -119,6 +119,7 @@ class DataprocPrereqRequest(BaseModel):
     gcs_bucket: str = "sumit_prakash_gcs"
     metastore_mode: str = "spark_default"  # "spark_default", "create", "existing"
     metastore_name: str = "tpcdi-benchmark-metastore"
+    metastore_path: str = ""  # Full path for existing metastore
 
 
 class DataprocFullRunRequest(BaseModel):
@@ -607,6 +608,36 @@ async def verify_prerequisites(req: DataprocPrereqRequest):
             steps.append({"step": "metastore", "name": metastore_service_id,
                            "status": "error", "error": str(e)[:500]})
             overall_ok = False
+    elif req.metastore_mode == "existing":
+        # Validate the existing metastore is reachable
+        metastore_path = req.metastore_path
+        if not metastore_path:
+            steps.append({"step": "metastore", "name": "Existing Metastore",
+                           "status": "error", "error": "No metastore path provided"})
+            overall_ok = False
+        else:
+            try:
+                import requests as http_requests
+                token = creds.token
+                if not token:
+                    creds.refresh(google.auth.transport.requests.Request())
+                    token = creds.token
+                ms_url = f"https://metastore.googleapis.com/v1/{metastore_path}"
+                ms_resp = http_requests.get(ms_url, headers={"Authorization": f"Bearer {token}"})
+                if ms_resp.status_code == 200:
+                    ms_data = ms_resp.json()
+                    ms_state = ms_data.get("state", "UNKNOWN")
+                    steps.append({"step": "metastore", "name": metastore_path.split("/")[-1],
+                                   "status": "exists", "state": ms_state, "full_name": metastore_path})
+                else:
+                    steps.append({"step": "metastore", "name": metastore_path.split("/")[-1],
+                                   "status": "error",
+                                   "error": f"Metastore not found or inaccessible ({ms_resp.status_code}): {ms_resp.text[:200]}"})
+                    overall_ok = False
+            except Exception as e:
+                steps.append({"step": "metastore", "name": metastore_path.split("/")[-1],
+                               "status": "error", "error": str(e)[:500]})
+                overall_ok = False
     elif req.metastore_mode == "spark_default":
         steps.append({"step": "metastore", "name": "Spark Default",
                        "status": "skipped", "message": "Using Spark's built-in Derby metastore (no external Hive metastore)"})

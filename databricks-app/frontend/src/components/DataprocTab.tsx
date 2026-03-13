@@ -486,6 +486,7 @@ export default function DataprocTab() {
           project, region, subnet, gcs_bucket: gcsBucket,
           metastore_mode: metastoreMode,
           metastore_name: metastoreName,
+          metastore_path: metastore,
         }),
       })
 
@@ -554,7 +555,8 @@ export default function DataprocTab() {
         method: 'POST',
         body: JSON.stringify({
           cluster_name: clusterName,
-          project, region, zone, subnet, metastore,
+          project, region, zone, subnet,
+          metastore: metastoreMode === 'existing' ? metastore : (metastoreMode === 'create' ? `projects/${project}/locations/${region}/services/${metastoreName}` : ''),
           image_version: '2.3-debian12',
           master_type: masterType,
           worker_type: workerType,
@@ -744,6 +746,27 @@ export default function DataprocTab() {
               <FormField label="Raw Data Path">
                 <div className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-md text-sm font-mono text-slate-700 max-w-[260px] truncate" title={rawDataPath}>{rawDataPath}</div>
               </FormField>
+              <FormField label="Hive Metastore">
+                <SelectInput
+                  value={metastoreMode}
+                  onChange={(v) => setMetastoreMode(v as 'spark_default' | 'create' | 'existing')}
+                  options={[
+                    { value: 'spark_default', label: 'Spark Default' },
+                    { value: 'create', label: 'Create Dataproc Metastore' },
+                    { value: 'existing', label: 'Use Existing Metastore' },
+                  ]}
+                />
+              </FormField>
+              {metastoreMode === 'create' && (
+                <FormField label="Metastore Name">
+                  <TextInput value={metastoreName} onChange={setMetastoreName} placeholder="tpcdi-benchmark-metastore" />
+                </FormField>
+              )}
+              {metastoreMode === 'existing' && (
+                <FormField label="Metastore Path">
+                  <TextInput value={metastore} onChange={setMetastore} placeholder="projects/.../locations/.../services/..." />
+                </FormField>
+              )}
               <ActionButton
                 label={e2eRunning ? 'Running...' : 'Run Full Pipeline'}
                 onClick={handleRunE2E}
