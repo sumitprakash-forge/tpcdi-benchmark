@@ -58,14 +58,17 @@ class DataGenJobRequest(BaseModel):
 
 class JobCreateRequest(BaseModel):
     job_name: str = "TPC-DI Benchmark"
+    load_type: str = "batch"
     scale_factor: int = 10
     raw_data_path: str
     catalog: str
     schema_name: str = "dw"
+    batch_id: str = ""
     cloud: str = "GCP"
     xml_format: str = "com.databricks.spark.xml"
     spark_version: str = "17.3.x-scala2.13"
-    node_type: str = "n2-highmem-16"
+    worker_node_type: str = "n2-highmem-16"
+    driver_node_type: str = "n2-highmem-16"
     num_workers: int = 3
     jar_path: str = ""
     photon: bool = True
@@ -256,20 +259,23 @@ async def create_job(req: JobCreateRequest):
             jar_path = f"/Volumes/{req.catalog}/{req.schema_name}/libs/spark-xml_2.13-0.18.0.jar"
 
         base_parameters = {
+            "load_type": req.load_type,
             "scale_factor": str(req.scale_factor),
-            "raw_data_path": req.raw_data_path,
-            "catalog": req.catalog,
-            "schema": req.schema_name,
+            "tpcdi_raw_data_path": req.raw_data_path,
+            "target_catalog": req.catalog,
+            "target_schema": req.schema_name,
+            "batch_id": req.batch_id,
             "cloud": req.cloud,
-            "xml_format": req.xml_format,
+            "customer_mgmt_xml_format": req.xml_format,
             "log_detailed_stats": str(req.log_detailed_stats).lower(),
+            "metrics_output": f"{req.raw_data_path}/metrics",
         }
 
         new_cluster = {
             "spark_version": req.spark_version,
-            "node_type_id": req.node_type,
+            "node_type_id": req.worker_node_type,
             "num_workers": req.num_workers,
-            "driver_node_type_id": req.node_type,
+            "driver_node_type_id": req.driver_node_type,
             "runtime_engine": "PHOTON" if req.photon else "STANDARD",
             "data_security_mode": "SINGLE_USER",
             "spark_conf": {

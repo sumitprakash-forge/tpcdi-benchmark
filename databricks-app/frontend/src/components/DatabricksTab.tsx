@@ -30,18 +30,60 @@ export default function DatabricksTab() {
   const [saKeyJson, setSaKeyJson] = useState('')
 
   // Benchmark config state
+  const [loadType, setLoadType] = useState('batch')
   const [scaleFactor, setScaleFactor] = useState('10')
   const [rawDataPath, setRawDataPath] = useState('gs://sumit_prakash_gcs/tpcdi')
   const [targetCatalog, setTargetCatalog] = useState('gcp_tpcdi_classic')
   const [targetSchema, setTargetSchema] = useState('dw')
+  const [batchId, setBatchId] = useState('')
   const [cloud, setCloud] = useState('GCP')
   const [xmlFormat, setXmlFormat] = useState('com.databricks.spark.xml')
   const [sparkVersion, setSparkVersion] = useState('17.3.x-scala2.13')
-  const [nodeType, setNodeType] = useState('n2-highmem-16')
+  const [workerNodeType, setWorkerNodeType] = useState('n2-highmem-16')
+  const [driverNodeType, setDriverNodeType] = useState('n2-highmem-16')
   const [numWorkers, setNumWorkers] = useState(3)
   const [jarPath, setJarPath] = useState('')
   const [photon, setPhoton] = useState(true)
   const [logDetailedStats, setLogDetailedStats] = useState(true)
+
+  // GCP node type options
+  const gcpNodeTypes = [
+    { value: 'n2d-standard-4', label: 'n2d-standard-4 (4 vCPU, 16 GB)' },
+    { value: 'n2d-standard-8', label: 'n2d-standard-8 (8 vCPU, 32 GB)' },
+    { value: 'n2d-standard-16', label: 'n2d-standard-16 (16 vCPU, 64 GB)' },
+    { value: 'n2d-standard-32', label: 'n2d-standard-32 (32 vCPU, 128 GB)' },
+    { value: 'n2d-standard-48', label: 'n2d-standard-48 (48 vCPU, 192 GB)' },
+    { value: 'n2d-standard-64', label: 'n2d-standard-64 (64 vCPU, 256 GB)' },
+    { value: 'n2d-standard-80', label: 'n2d-standard-80 (80 vCPU, 320 GB)' },
+    { value: 'n2d-standard-96', label: 'n2d-standard-96 (96 vCPU, 384 GB)' },
+    { value: 'n2d-highmem-4', label: 'n2d-highmem-4 (4 vCPU, 32 GB)' },
+    { value: 'n2d-highmem-8', label: 'n2d-highmem-8 (8 vCPU, 64 GB)' },
+    { value: 'n2d-highmem-16', label: 'n2d-highmem-16 (16 vCPU, 128 GB)' },
+    { value: 'n2d-highmem-32', label: 'n2d-highmem-32 (32 vCPU, 256 GB)' },
+    { value: 'n2d-highmem-48', label: 'n2d-highmem-48 (48 vCPU, 384 GB)' },
+    { value: 'n2d-highmem-64', label: 'n2d-highmem-64 (64 vCPU, 512 GB)' },
+    { value: 'n2d-highmem-80', label: 'n2d-highmem-80 (80 vCPU, 640 GB)' },
+    { value: 'n2d-highmem-96', label: 'n2d-highmem-96 (96 vCPU, 768 GB)' },
+    { value: 'n2-highmem-16', label: 'n2-highmem-16 (16 vCPU, 128 GB)' },
+    { value: 'c2-standard-4', label: 'c2-standard-4 (4 vCPU, 16 GB)' },
+    { value: 'c2-standard-8', label: 'c2-standard-8 (8 vCPU, 32 GB)' },
+    { value: 'c2-standard-16', label: 'c2-standard-16 (16 vCPU, 64 GB)' },
+    { value: 'c2-standard-30', label: 'c2-standard-30 (30 vCPU, 120 GB)' },
+  ]
+
+  // Sizing suggestions based on load type and scale factor
+  const sizingSuggestion = (() => {
+    const sf = parseInt(scaleFactor)
+    if (loadType === 'batch') {
+      if (sf >= 10000) return 'Recommended: Driver n2d-standard-8, Worker n2d-standard-16, 6 workers'
+      if (sf >= 1000) return 'Recommended: Driver n2d-standard-8, Worker n2d-standard-8, 5 workers'
+      return null
+    } else {
+      if (sf >= 10000) return 'Recommended: Driver n2d-standard-8, Worker n2d-standard-8, 5 workers'
+      if (sf >= 1000) return 'Recommended: Driver n2d-standard-8, Worker n2d-standard-8, 3 workers'
+      return null
+    }
+  })()
 
   // Run state
   const [jobId, setJobId] = useState<number | null>(null)
@@ -181,15 +223,18 @@ export default function DatabricksTab() {
       const result = await apiCall('/api/databricks/create-job', {
         method: 'POST',
         body: JSON.stringify({
-          job_name: `TPC-DI Benchmark SF${scaleFactor}`,
+          job_name: `TPC-DI Benchmark SF${scaleFactor} ${loadType}`,
+          load_type: loadType,
           scale_factor: parseInt(scaleFactor),
           raw_data_path: rawDataPath,
           catalog: targetCatalog,
           schema_name: targetSchema,
+          batch_id: batchId || '',
           cloud,
           xml_format: xmlFormat,
           spark_version: sparkVersion,
-          node_type: nodeType,
+          worker_node_type: workerNodeType,
+          driver_node_type: driverNodeType,
           num_workers: numWorkers,
           jar_path: effectiveJarPath,
           photon,
@@ -313,6 +358,16 @@ export default function DatabricksTab() {
       {/* Benchmark Configuration Section */}
       <Section title="2. Benchmark Configuration">
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 pt-4">
+          <FormField label="Load Type">
+            <SelectInput
+              value={loadType}
+              onChange={setLoadType}
+              options={[
+                { value: 'batch', label: 'Batch (Historical Load)' },
+                { value: 'incremental', label: 'Incremental' },
+              ]}
+            />
+          </FormField>
           <FormField label="Scale Factor">
             <SelectInput
               value={scaleFactor}
@@ -321,9 +376,23 @@ export default function DatabricksTab() {
                 { value: '10', label: '10' },
                 { value: '100', label: '100' },
                 { value: '1000', label: '1000' },
+                { value: '5000', label: '5000' },
+                { value: '10000', label: '10000' },
               ]}
             />
           </FormField>
+          {loadType === 'incremental' && (
+            <FormField label="Batch ID" hint="Incremental batch: 2 or 3">
+              <SelectInput
+                value={batchId}
+                onChange={setBatchId}
+                options={[
+                  { value: '2', label: 'Batch 2' },
+                  { value: '3', label: 'Batch 3' },
+                ]}
+              />
+            </FormField>
+          )}
           <FormField label="Raw Data Path">
             <TextInput value={rawDataPath} onChange={setRawDataPath} placeholder="gs://bucket/tpcdi" />
           </FormField>
@@ -362,14 +431,17 @@ export default function DatabricksTab() {
               value={sparkVersion}
               onChange={setSparkVersion}
               options={[
-                { value: '17.3.x-scala2.13', label: '17.3.x-scala2.13' },
-                { value: '16.4.x-scala2.12', label: '16.4.x-scala2.12' },
-                { value: '15.4.x-scala2.12', label: '15.4.x-scala2.12' },
+                { value: '17.3.x-scala2.13', label: '17.3.x-scala2.13 (LTS)' },
+                { value: '16.4.x-scala2.12', label: '16.4.x-scala2.12 (LTS)' },
+                { value: '15.4.x-scala2.12', label: '15.4.x-scala2.12 (LTS)' },
               ]}
             />
           </FormField>
-          <FormField label="Node Type">
-            <TextInput value={nodeType} onChange={setNodeType} placeholder="n2-highmem-16" />
+          <FormField label="Worker Node Type">
+            <SelectInput value={workerNodeType} onChange={setWorkerNodeType} options={gcpNodeTypes} />
+          </FormField>
+          <FormField label="Driver Node Type">
+            <SelectInput value={driverNodeType} onChange={setDriverNodeType} options={gcpNodeTypes} />
           </FormField>
           <FormField label="Number of Workers">
             <NumberInput value={numWorkers} onChange={setNumWorkers} min={1} max={100} />
@@ -384,6 +456,16 @@ export default function DatabricksTab() {
             <Checkbox checked={logDetailedStats} onChange={setLogDetailedStats} label="Log Detailed Stats" />
           </div>
         </div>
+
+        {/* Sizing Suggestion */}
+        {sizingSuggestion && (
+          <div className="mt-4 p-3 bg-amber-50 border border-amber-200 rounded-lg">
+            <p className="text-sm text-amber-800">
+              <span className="font-semibold">Sizing suggestion for {loadType} SF={scaleFactor}:</span>{' '}
+              {sizingSuggestion}
+            </p>
+          </div>
+        )}
       </Section>
 
       {/* Run Section */}
