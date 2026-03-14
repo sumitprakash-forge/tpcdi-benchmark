@@ -153,11 +153,27 @@ export default function DataprocTab() {
 
   // Manual mode config
   const [clusterName, setClusterName] = useState('tpcdi-dataproc-cluster')
-  const [masterType, setMasterType] = useState('n2d-standard-8')
-  const [workerType, setWorkerType] = useState('n2d-standard-8')
-  const [numWorkers, setNumWorkers] = useState(3)
-  const [ssdCount, setSsdCount] = useState(2)
   const [scaleFactor, setScaleFactor] = useState('1000')
+
+  // Per-step cluster config (batch, inc-b2, inc-b3)
+  interface StepClusterConfig {
+    masterType: string
+    workerType: string
+    numWorkers: number
+    ssdCount: number
+  }
+  function buildDefaultStepConfigs(sf: number): StepClusterConfig[] {
+    return MANUAL_PIPELINE_SPECS.map(spec => {
+      const sizing = getDataprocSizing(sf, spec.loadType)
+      return { masterType: sizing.master, workerType: sizing.worker, numWorkers: sizing.workers, ssdCount: sizing.ssds }
+    })
+  }
+  const [stepConfigs, setStepConfigs] = useState<StepClusterConfig[]>(buildDefaultStepConfigs(1000))
+  const [expandedStepConfig, setExpandedStepConfig] = useState<number | null>(null)
+
+  function updateStepConfig(idx: number, updates: Partial<StepClusterConfig>) {
+    setStepConfigs(prev => prev.map((c, i) => i === idx ? { ...c, ...updates } : c))
+  }
 
   // Manual prereqs state
   interface PrereqCheckItem {
@@ -170,6 +186,11 @@ export default function DataprocTab() {
   const [manualPrereqs, setManualPrereqs] = useState<PrereqCheckItem[]>([])
   const [manualPrereqStatus, setManualPrereqStatus] = useState<'idle' | 'checking' | 'ready' | 'error'>('idle')
   const [manualPrereqChecking, setManualPrereqChecking] = useState(false)
+
+  // Auto-update per-step configs when scale factor changes
+  useEffect(() => {
+    setStepConfigs(buildDefaultStepConfigs(parseInt(scaleFactor) || 1000))
+  }, [scaleFactor])
 
   // Manual pipeline state
   const [manualPipelineSteps, setManualPipelineSteps] = useState<ManualPipelineStep[]>(buildManualPipelineSteps())
@@ -592,10 +613,11 @@ export default function DataprocTab() {
   async function startManualPipelineStep(spec: typeof MANUAL_PIPELINE_SPECS[0]) {
     const { loadType: lt, batchId: bid, stepIndex, label, clusterSuffix } = spec
     const clName = `${clusterName}${clusterSuffix}`
+    const cfg = stepConfigs[stepIndex]
 
     setManualRunId('pending')
     setManualActiveStep(stepIndex)
-    updateManualStep(stepIndex, { status: 'running', output: `${label} | Starting full cycle (create cluster -> run job -> delete cluster)...` })
+    updateManualStep(stepIndex, { status: 'running', output: `${label} | ${cfg.workerType} x${cfg.numWorkers}, ${cfg.ssdCount} SSDs | Starting full cycle...` })
 
     try {
       const result = await apiCall('/api/dataproc/run-full-cycle', {
@@ -605,10 +627,10 @@ export default function DataprocTab() {
           project, region, zone, subnet,
           metastore: metastoreMode === 'existing' ? metastore : (metastoreMode === 'create' ? `projects/${project}/locations/${region}/services/${metastoreName}` : ''),
           image_version: '2.3-debian12',
-          master_type: masterType,
-          worker_type: workerType,
-          num_workers: numWorkers,
-          ssd_count: ssdCount,
+          master_type: cfg.masterType,
+          worker_type: cfg.workerType,
+          num_workers: cfg.numWorkers,
+          ssd_count: cfg.ssdCount,
           load_type: lt,
           batch_id: bid,
           scale_factor: parseInt(scaleFactor),
@@ -1411,54 +1433,72 @@ export default function DataprocTab() {
         </div>
       </Section>
 
-      {/* Section 2: Cluster & Job Configuration */}
-      <Section title="2. Cluster & Job Configuration" colorScheme="amber">
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 pt-4">
-          <FormField label="Cluster Name (base)">
-            <TextInput value={clusterName} onChange={setClusterName} placeholder="tpcdi-cluster" />
-          </FormField>
-          <FormField label="Master Machine Type">
-            <SelectInput value={masterType} onChange={setMasterType} options={gcpNodeTypes} />
-          </FormField>
-          <FormField label="Worker Machine Type">
-            <SelectInput value={workerType} onChange={setWorkerType} options={gcpNodeTypes} />
-          </FormField>
-          <FormField label="Number of Workers">
-            <NumberInput value={numWorkers} onChange={setNumWorkers} min={1} max={100} />
-          </FormField>
-          <FormField label="Worker SSDs">
-            <NumberInput value={ssdCount} onChange={setSsdCount} min={0} max={8} />
-          </FormField>
-          <FormField label="Scale Factor">
-            <SelectInput
-              value={scaleFactor}
-              onChange={setScaleFactor}
-              options={[
-                { value: '100', label: 'SF 100' },
-                { value: '1000', label: 'SF 1000' },
-                { value: '10000', label: 'SF 10000' },
-              ]}
-            />
-          </FormField>
-          <FormField label="Raw Data Path">
-            <TextInput value={rawDataPath} onChange={setRawDataPath} placeholder="gs://bucket/tpcdi" />
-          </FormField>
-          <FormField label="Target Database">
-            <TextInput value={targetDatabase} onChange={setTargetDatabase} placeholder="tpcdi_warehouse" />
-          </FormField>
-          <FormField label="Metrics Output">
-            <TextInput value={metricsOutput} onChange={setMetricsOutput} placeholder="gs://bucket/metrics" />
-          </FormField>
-        </div>
-      </Section>
-
-      {/* Section 3: Run Pipeline */}
-      <Section title="3. Run Pipeline" defaultOpen={true} colorScheme="blue">
+      {/* Section 2: Run Pipeline */}
+      <Section title="2. Run Pipeline" defaultOpen={true} colorScheme="blue">
         <div className="pt-4">
-          {/* Pipeline info and controls */}
-          <div className="flex flex-wrap items-end gap-4 mb-6">
+
+          {/* Infrastructure Prerequisites status bar */}
+          {manualPrereqStatus !== 'idle' && (
+            <div className={`mb-4 p-3 rounded-lg border flex items-center gap-2 ${
+              manualPrereqStatus === 'ready' ? 'bg-green-50 border-green-200' :
+              manualPrereqStatus === 'checking' ? 'bg-blue-50 border-blue-200' :
+              'bg-red-50 border-red-200'
+            }`}>
+              <span className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${
+                manualPrereqStatus === 'ready' ? 'bg-green-500' :
+                manualPrereqStatus === 'checking' ? 'bg-blue-500 animate-pulse' :
+                'bg-red-500'
+              }`} />
+              <span className={`text-xs font-medium ${
+                manualPrereqStatus === 'ready' ? 'text-green-700' :
+                manualPrereqStatus === 'checking' ? 'text-blue-700' :
+                'text-red-700'
+              }`}>
+                {manualPrereqStatus === 'ready' ? 'Infrastructure Prerequisites Ready' :
+                 manualPrereqStatus === 'checking' ? 'Checking Infrastructure Prerequisites...' :
+                 'Infrastructure Prerequisites - Issues Found'}
+              </span>
+              {manualPrereqStatus === 'ready' && (
+                <span className="text-[10px] text-green-500 ml-1">
+                  ({manualPrereqs.filter(p => p.status === 'exists' || p.status === 'created').length}/{manualPrereqs.length} passed)
+                </span>
+              )}
+            </div>
+          )}
+
+          {/* Shared config row */}
+          <div className="mb-5 p-4 bg-slate-50 rounded-lg border border-slate-200">
+            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
+              <FormField label="Scale Factor">
+                <SelectInput
+                  value={scaleFactor}
+                  onChange={setScaleFactor}
+                  options={[
+                    { value: '100', label: 'SF 100' },
+                    { value: '1000', label: 'SF 1000' },
+                    { value: '10000', label: 'SF 10000' },
+                  ]}
+                />
+              </FormField>
+              <FormField label="Cluster Name (base)">
+                <TextInput value={clusterName} onChange={setClusterName} placeholder="tpcdi-cluster" />
+              </FormField>
+              <FormField label="Raw Data Path">
+                <TextInput value={rawDataPath} onChange={setRawDataPath} placeholder="gs://bucket/tpcdi" />
+              </FormField>
+              <FormField label="Target Database">
+                <TextInput value={targetDatabase} onChange={setTargetDatabase} placeholder="tpcdi_warehouse" />
+              </FormField>
+              <FormField label="Metrics Output">
+                <TextInput value={metricsOutput} onChange={setMetricsOutput} placeholder="gs://bucket/metrics" />
+              </FormField>
+            </div>
+          </div>
+
+          {/* Pipeline controls */}
+          <div className="flex flex-wrap items-center gap-4 mb-6">
             <div className="text-sm text-slate-600">
-              <span className="font-semibold">3-Step Pipeline:</span> Batch Load &rarr; Incremental Batch 2 &rarr; Incremental Batch 3 (SF {scaleFactor})
+              <span className="font-semibold">3-Step Pipeline:</span> Batch Load &rarr; Incremental Batch 2 &rarr; Incremental Batch 3
             </div>
             <ActionButton
               label={manualPipelineRunning ? 'Running...' : 'Run Pipeline'}
@@ -1477,62 +1517,100 @@ export default function DataprocTab() {
             )}
           </div>
 
-          {/* Step Progress Cards */}
+          {/* Step Cards with per-step cluster config */}
           <div className="space-y-3">
-            {manualPipelineSteps.map((step, i) => (
+            {manualPipelineSteps.map((step, i) => {
+              const cfg = stepConfigs[i]
+              const isExpanded = expandedStepConfig === i
+              return (
               <div
                 key={i}
-                className={`p-4 rounded-lg border transition-all ${
+                className={`rounded-lg border transition-all ${
                   step.status === 'pending' ? 'bg-slate-50 border-slate-200' :
                   step.status === 'running' ? 'bg-blue-50 border-blue-300 shadow-sm' :
                   step.status === 'success' ? 'bg-green-50 border-green-300' :
                   'bg-red-50 border-red-300'
                 }`}
               >
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-3">
-                    <span className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold ${
-                      step.status === 'pending' ? 'bg-slate-200 text-slate-500' :
-                      step.status === 'running' ? 'bg-blue-500 text-white animate-pulse' :
-                      step.status === 'success' ? 'bg-green-500 text-white' :
-                      'bg-red-500 text-white'
-                    }`}>
-                      {step.status === 'success' ? '\u2713' : step.status === 'error' ? '!' : i + 1}
-                    </span>
-                    <span className="text-sm font-semibold text-slate-700">Step {i + 1}: {step.name}</span>
+                <div className="p-4">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                      <span className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold ${
+                        step.status === 'pending' ? 'bg-slate-200 text-slate-500' :
+                        step.status === 'running' ? 'bg-blue-500 text-white animate-pulse' :
+                        step.status === 'success' ? 'bg-green-500 text-white' :
+                        'bg-red-500 text-white'
+                      }`}>
+                        {step.status === 'success' ? '\u2713' : step.status === 'error' ? '!' : i + 1}
+                      </span>
+                      <div>
+                        <span className="text-sm font-semibold text-slate-700">{step.name}</span>
+                        <p className="text-[10px] text-slate-400 font-mono">
+                          {cfg.workerType} x{cfg.numWorkers} workers, {cfg.ssdCount} SSDs | {cfg.masterType} master
+                        </p>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      {step.duration_ms !== null && (
+                        <span className="text-xs font-mono text-slate-500">{formatDuration(step.duration_ms)}</span>
+                      )}
+                      {manualCosts[i] && (
+                        <span className="text-xs font-mono text-blue-600">{formatCost(manualCosts[i]!.total_cost_usd)}</span>
+                      )}
+                      {step.link && (
+                        <a href={step.link} target="_blank" rel="noopener noreferrer"
+                          className="text-xs text-blue-600 hover:text-blue-700 underline">
+                          View in GCP Console
+                        </a>
+                      )}
+                      <span className={`text-[10px] font-medium uppercase px-2 py-0.5 rounded ${
+                        step.status === 'pending' ? 'bg-slate-200 text-slate-500' :
+                        step.status === 'running' ? 'bg-blue-100 text-blue-700' :
+                        step.status === 'success' ? 'bg-green-100 text-green-700' :
+                        'bg-red-100 text-red-700'
+                      }`}>
+                        {step.status}
+                      </span>
+                      {step.status === 'pending' && !manualPipelineRunning && (
+                        <button
+                          onClick={() => setExpandedStepConfig(isExpanded ? null : i)}
+                          className="text-[10px] text-slate-400 hover:text-slate-600 underline"
+                        >
+                          {isExpanded ? 'Hide Config' : 'Edit Config'}
+                        </button>
+                      )}
+                    </div>
                   </div>
-                  <div className="flex items-center gap-3">
-                    {step.duration_ms !== null && (
-                      <span className="text-xs font-mono text-slate-500">{formatDuration(step.duration_ms)}</span>
-                    )}
-                    {manualCosts[i] && (
-                      <span className="text-xs font-mono text-blue-600">{formatCost(manualCosts[i]!.total_cost_usd)}</span>
-                    )}
-                    {step.link && (
-                      <a
-                        href={step.link}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="text-xs text-blue-600 hover:text-blue-700 underline"
-                      >
-                        View in GCP Console
-                      </a>
-                    )}
-                    <span className={`text-[10px] font-medium uppercase px-2 py-0.5 rounded ${
-                      step.status === 'pending' ? 'bg-slate-200 text-slate-500' :
-                      step.status === 'running' ? 'bg-blue-100 text-blue-700' :
-                      step.status === 'success' ? 'bg-green-100 text-green-700' :
-                      'bg-red-100 text-red-700'
-                    }`}>
-                      {step.status}
-                    </span>
-                  </div>
+                  {step.output && (
+                    <p className="mt-2 text-xs text-slate-600 ml-10 break-words">{step.output}</p>
+                  )}
                 </div>
-                {step.output && (
-                  <p className="mt-2 text-xs text-slate-600 ml-10 break-words">{step.output}</p>
+
+                {/* Expandable per-step cluster config */}
+                {isExpanded && step.status === 'pending' && !manualPipelineRunning && (
+                  <div className="px-4 pb-4 pt-0">
+                    <div className="ml-10 p-3 bg-white rounded-lg border border-slate-200">
+                      <p className="text-[10px] text-slate-500 uppercase font-semibold mb-2">Cluster Configuration</p>
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                        <FormField label="Master Type">
+                          <SelectInput value={cfg.masterType} onChange={(v) => updateStepConfig(i, { masterType: v })} options={gcpNodeTypes} />
+                        </FormField>
+                        <FormField label="Worker Type">
+                          <SelectInput value={cfg.workerType} onChange={(v) => updateStepConfig(i, { workerType: v })} options={gcpNodeTypes} />
+                        </FormField>
+                        <FormField label="Workers">
+                          <NumberInput value={cfg.numWorkers} onChange={(v) => updateStepConfig(i, { numWorkers: v })} min={1} max={100} />
+                        </FormField>
+                        <FormField label="SSDs per Node">
+                          <NumberInput value={cfg.ssdCount} onChange={(v) => updateStepConfig(i, { ssdCount: v })} min={0} max={8} />
+                        </FormField>
+                      </div>
+                    </div>
+                  </div>
                 )}
               </div>
-            ))}
+              )
+            })}
           </div>
 
           {/* Cost Breakdown - per step */}
