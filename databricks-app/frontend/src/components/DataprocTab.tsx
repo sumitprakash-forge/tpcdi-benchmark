@@ -512,10 +512,34 @@ export default function DataprocTab() {
 
   // Auto-continue: when a run completes, start next spec
   useEffect(() => {
-    if (e2eRunId !== null || !e2eRunning || e2eRemainingSpecs.length === 0) return
+    if (e2eRunId !== null || !e2eRunning) return
     if (e2eCancelledRef.current) {
       setE2eRunning(false)
       setE2eRemainingSpecs([])
+      return
+    }
+    // All specs done — pipeline complete
+    if (e2eRemainingSpecs.length === 0) {
+      setE2eRunning(false)
+      setE2eActiveStep(null)
+      ;(async () => {
+        try {
+          await fetch('/api/databricks/save-run', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              run_data: {
+                platform: 'dataproc',
+                mode: 'e2e',
+                scale_factor: e2eSF,
+                steps: e2eSteps,
+                costs: runCosts,
+                completed_at: new Date().toISOString(),
+              }
+            })
+          })
+        } catch {}
+      })()
       return
     }
     const [next, ...rest] = e2eRemainingSpecs

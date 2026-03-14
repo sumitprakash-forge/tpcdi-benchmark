@@ -701,6 +701,24 @@ export default function DatabricksTab() {
     if (e2eRemainingSpecs.length === 0) {
       setE2eRunning(false)
       setE2eActiveStep(null)
+      ;(async () => {
+        try {
+          await fetch('/api/databricks/save-run', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              run_data: {
+                platform: 'databricks',
+                mode: 'e2e',
+                scale_factor: e2eSF,
+                steps: e2eSteps,
+                costs: runCosts,
+                completed_at: new Date().toISOString(),
+              }
+            })
+          })
+        } catch {}
+      })()
       return
     }
     // Don't auto-continue while a spec is being started (prevents race condition)

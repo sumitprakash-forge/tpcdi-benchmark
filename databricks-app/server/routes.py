@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from server.config import get_workspace_client, get_user_email
+from server import run_history
 
 router = APIRouter()
 
@@ -1288,6 +1289,26 @@ async def cancel_run(run_id: int, request: Request):
 
 
 # ── Health ──────────────────────────────────────────────────────────────────
+
+class SaveRunRequest(BaseModel):
+    run_data: dict
+
+
+@router.post("/databricks/save-run")
+async def save_run(req: SaveRunRequest, request: Request):
+    result = run_history.save_run(request, req.run_data)
+    return result
+
+
+@router.get("/databricks/run-history")
+async def list_run_history(request: Request, limit: int = Query(50)):
+    return run_history.list_runs(request, limit)
+
+
+@router.delete("/databricks/run-history/{filename}")
+async def delete_run_history(filename: str, request: Request):
+    return run_history.delete_run(request, filename)
+
 
 @router.get("/health")
 async def health():
