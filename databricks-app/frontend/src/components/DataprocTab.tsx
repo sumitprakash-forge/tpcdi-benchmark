@@ -159,6 +159,18 @@ export default function DataprocTab() {
   const [ssdCount, setSsdCount] = useState(2)
   const [scaleFactor, setScaleFactor] = useState('1000')
 
+  // Manual prereqs state
+  interface PrereqCheckItem {
+    label: string
+    name: string
+    status: 'pending' | 'checking' | 'exists' | 'created' | 'creating' | 'skipped' | 'warning' | 'error'
+    error?: string
+    message?: string
+  }
+  const [manualPrereqs, setManualPrereqs] = useState<PrereqCheckItem[]>([])
+  const [manualPrereqStatus, setManualPrereqStatus] = useState<'idle' | 'checking' | 'ready' | 'error'>('idle')
+  const [manualPrereqChecking, setManualPrereqChecking] = useState(false)
+
   // Manual pipeline state
   const [manualPipelineSteps, setManualPipelineSteps] = useState<ManualPipelineStep[]>(buildManualPipelineSteps())
   const [manualPipelineRunning, setManualPipelineRunning] = useState(false)
@@ -776,6 +788,107 @@ export default function DataprocTab() {
     }
   }
 
+  // ── Manual prereq check ─────────────────────────────────────────────
+  async function handleCheckManualPrereqs() {
+    setManualPrereqChecking(true)
+    setManualPrereqStatus('checking')
+
+    // Build the initial items based on config
+    const items: PrereqCheckItem[] = [
+      { label: 'GCP Authentication', name: '', status: 'checking' },
+      { label: 'VPC Network', name: 'tpcdi-benchmark-vpc', status: 'pending' },
+      { label: 'Subnet', name: subnet, status: 'pending' },
+      { label: 'Firewall (Internal)', name: 'tpcdi-benchmark-allow-internal', status: 'pending' },
+      { label: 'Cloud NAT', name: 'tpcdi-benchmark-nat', status: 'pending' },
+      { label: 'GCS Bucket', name: `gs://${gcsBucket}`, status: 'pending' },
+    ]
+    if (metastoreMode === 'create') {
+      items.push({ label: 'Dataproc Metastore', name: metastoreName, status: 'pending' })
+    }
+    setManualPrereqs([...items])
+
+    // Step 1: Check auth
+    try {
+      const auth = await apiCall('/api/dataproc/auth/status')
+      if (auth.status !== 'authenticated') {
+        items[0] = { ...items[0], status: 'error', name: '', error: auth.message || 'Not authenticated' }
+        setManualPrereqs([...items])
+        setManualPrereqStatus('error')
+        setManualPrereqChecking(false)
+        return
+      }
+      items[0] = { ...items[0], status: 'exists', name: auth.account || '' }
+      setManualPrereqs([...items])
+    } catch (e: any) {
+      items[0] = { ...items[0], status: 'error', error: e.message }
+      setManualPrereqs([...items])
+      setManualPrereqStatus('error')
+      setManualPrereqChecking(false)
+      return
+    }
+
+    // Step 2: Mark infra items as checking
+    for (let i = 1; i < items.length; i++) {
+      items[i] = { ...items[i], status: 'checking' }
+    }
+    setManualPrereqs([...items])
+
+    // Step 3: Call verify-prerequisites
+    try {
+      const prereqs = await apiCall('/api/dataproc/verify-prerequisites', {
+        method: 'POST',
+        body: JSON.stringify({
+          project, region, subnet, gcs_bucket: gcsBucket,
+          metastore_mode: metastoreMode,
+          metastore_name: metastoreName,
+          metastore_path: metastore,
+        }),
+      })
+
+      // Map backend steps to our items
+      const stepMap: Record<string, number> = {
+        vpc_network: 1,
+        subnet: 2,
+        firewall_internal: 3,
+        cloud_nat: 4,
+        gcs_bucket: 5,
+        metastore: metastoreMode === 'create' ? 6 : -1,
+      }
+
+      for (const s of (prereqs.steps || [])) {
+        const idx = stepMap[s.step]
+        if (idx !== undefined && idx >= 0 && idx < items.length) {
+          items[idx] = {
+            ...items[idx],
+            name: s.name || items[idx].name,
+            status: s.status as PrereqCheckItem['status'],
+            error: s.error,
+            message: s.message,
+          }
+        }
+      }
+
+      setManualPrereqs([...items])
+
+      if (prereqs.status === 'ready') {
+        setManualPrereqStatus('ready')
+      } else {
+        setManualPrereqStatus('error')
+      }
+    } catch (e: any) {
+      // Mark all pending/checking as error
+      for (let i = 1; i < items.length; i++) {
+        if (items[i].status === 'checking' || items[i].status === 'pending') {
+          items[i] = { ...items[i], status: 'error', error: e.message }
+        }
+      }
+      setManualPrereqs([...items])
+      setManualPrereqStatus('error')
+    } finally {
+      setManualPrereqChecking(false)
+    }
+  }
+
   // ── Render ───────────────────────────────────────────────────────────
 
   return (
@@ -1190,6 +1303,109 @@ export default function DataprocTab() {
               <FormField label="Metastore Service Path">
                 <TextInput value={metastore} onChange={setMetastore} placeholder="projects/.../locations/.../services/..." />
               </FormField>
+            )}
+          </div>
+
+          {/* Check Prerequisites */}
+          <div className="mt-5 pt-4 border-t border-emerald-100">
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <h4 className="text-sm font-semibold text-slate-700">Infrastructure Prerequisites</h4>
+                <p className="text-xs text-slate-500 mt-0.5">Verify and auto-create VPC, subnet, firewall, Cloud NAT, GCS bucket{metastoreMode === 'create' ? ', and Dataproc Metastore' : ''}</p>
+              </div>
+              <div className="flex items-center gap-3">
+                {manualPrereqStatus === 'ready' && (
+                  <span className="flex items-center gap-1.5 text-xs font-medium text-green-700 bg-green-50 px-2.5 py-1 rounded-full border border-green-200">
+                    <span className="w-2 h-2 rounded-full bg-green-500" />
+                    All Ready
+                  </span>
+                )}
+                {manualPrereqStatus === 'error' && (
+                  <span className="flex items-center gap-1.5 text-xs font-medium text-red-700 bg-red-50 px-2.5 py-1 rounded-full border border-red-200">
+                    <span className="w-2 h-2 rounded-full bg-red-500" />
+                    Issues Found
+                  </span>
+                )}
+                <ActionButton
+                  label={manualPrereqChecking ? 'Checking...' : manualPrereqStatus === 'ready' ? 'Re-check' : 'Check Prerequisites'}
+                  onClick={handleCheckManualPrereqs}
+                  loading={manualPrereqChecking}
+                  disabled={manualPrereqChecking}
+                  variant="secondary"
+                />
+              </div>
+            </div>
+
+            {/* Prereq Status Cards */}
+            {manualPrereqs.length > 0 && (
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                {manualPrereqs.map((item, idx) => (
+                  <div
+                    key={idx}
+                    className={`p-3 rounded-lg border transition-all ${
+                      item.status === 'pending' ? 'bg-slate-50 border-slate-200' :
+                      item.status === 'checking' ? 'bg-blue-50 border-blue-200' :
+                      item.status === 'exists' ? 'bg-green-50 border-green-200' :
+                      item.status === 'created' ? 'bg-emerald-50 border-emerald-200' :
+                      item.status === 'creating' ? 'bg-blue-50 border-blue-300' :
+                      item.status === 'skipped' ? 'bg-slate-50 border-slate-200' :
+                      item.status === 'warning' ? 'bg-amber-50 border-amber-200' :
+                      'bg-red-50 border-red-200'
+                    }`}
+                  >
+                    <div className="flex items-start gap-2.5">
+                      {/* Status Icon */}
+                      <span className={`mt-0.5 w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold flex-shrink-0 ${
+                        item.status === 'pending' ? 'bg-slate-200 text-slate-500' :
+                        item.status === 'checking' ? 'bg-blue-400 text-white animate-pulse' :
+                        item.status === 'exists' ? 'bg-green-500 text-white' :
+                        item.status === 'created' ? 'bg-emerald-500 text-white' :
+                        item.status === 'creating' ? 'bg-blue-500 text-white animate-pulse' :
+                        item.status === 'skipped' ? 'bg-slate-400 text-white' :
+                        item.status === 'warning' ? 'bg-amber-500 text-white' :
+                        'bg-red-500 text-white'
+                      }`}>
+                        {item.status === 'exists' || item.status === 'created' ? '\u2713' :
+                         item.status === 'checking' || item.status === 'creating' ? '\u2026' :
+                         item.status === 'error' ? '\u00d7' :
+                         item.status === 'warning' ? '!' :
+                         item.status === 'skipped' ? '\u2013' :
+                         '\u2022'}
+                      </span>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center justify-between">
+                          <p className="text-xs font-semibold text-slate-700">{item.label}</p>
+                          <span className={`text-[9px] font-medium uppercase px-1.5 py-0.5 rounded ${
+                            item.status === 'pending' ? 'bg-slate-100 text-slate-500' :
+                            item.status === 'checking' ? 'bg-blue-100 text-blue-600' :
+                            item.status === 'exists' ? 'bg-green-100 text-green-700' :
+                            item.status === 'created' ? 'bg-emerald-100 text-emerald-700' :
+                            item.status === 'creating' ? 'bg-blue-100 text-blue-700' :
+                            item.status === 'skipped' ? 'bg-slate-100 text-slate-500' :
+                            item.status === 'warning' ? 'bg-amber-100 text-amber-700' :
+                            'bg-red-100 text-red-700'
+                          }`}>
+                            {item.status === 'exists' ? 'exists' :
+                             item.status === 'created' ? 'created' :
+                             item.status === 'creating' ? 'creating...' :
+                             item.status === 'checking' ? 'checking...' :
+                             item.status}
+                          </span>
+                        </div>
+                        {item.name && (
+                          <p className="text-[10px] text-slate-500 font-mono mt-0.5 truncate" title={item.name}>{item.name}</p>
+                        )}
+                        {item.message && (
+                          <p className="text-[10px] text-blue-600 mt-1">{item.message}</p>
+                        )}
+                        {item.error && (
+                          <p className="text-[10px] text-red-600 mt-1 break-words">{item.error}</p>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
             )}
           </div>
         </div>
