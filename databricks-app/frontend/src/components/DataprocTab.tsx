@@ -152,11 +152,11 @@ export default function DataprocTab() {
   const [metricsOutput, setMetricsOutput] = useState('gs://sumit_prakash_gcs/tpcdi/metrics')
 
   // Manual mode config
-  const [clusterName, setClusterName] = useState('tpcdi-dataproc-cluster')
   const [scaleFactor, setScaleFactor] = useState('1000')
 
   // Per-step cluster config (batch, inc-b2, inc-b3)
   interface StepClusterConfig {
+    clusterName: string
     masterType: string
     workerType: string
     numWorkers: number
@@ -165,11 +165,18 @@ export default function DataprocTab() {
   function buildDefaultStepConfigs(sf: number): StepClusterConfig[] {
     return MANUAL_PIPELINE_SPECS.map(spec => {
       const sizing = getDataprocSizing(sf, spec.loadType)
-      return { masterType: sizing.master, workerType: sizing.worker, numWorkers: sizing.workers, ssdCount: sizing.ssds }
+      return {
+        clusterName: `tpcdi-dp-sf${sf}${spec.clusterSuffix}`,
+        masterType: sizing.master, workerType: sizing.worker,
+        numWorkers: sizing.workers, ssdCount: sizing.ssds,
+      }
     })
   }
   const [stepConfigs, setStepConfigs] = useState<StepClusterConfig[]>(buildDefaultStepConfigs(1000))
   const [expandedStepConfig, setExpandedStepConfig] = useState<number | null>(null)
+
+  // Teardown state per step
+  const [teardownStatus, setTeardownStatus] = useState<('idle' | 'deleting' | 'deleted' | 'not_found' | 'error')[]>(['idle', 'idle', 'idle'])
 
   function updateStepConfig(idx: number, updates: Partial<StepClusterConfig>) {
     setStepConfigs(prev => prev.map((c, i) => i === idx ? { ...c, ...updates } : c))
@@ -189,7 +196,9 @@ export default function DataprocTab() {
 
   // Auto-update per-step configs when scale factor changes
   useEffect(() => {
-    setStepConfigs(buildDefaultStepConfigs(parseInt(scaleFactor) || 1000))
+    const sf = parseInt(scaleFactor) || 1000
+    setStepConfigs(buildDefaultStepConfigs(sf))
+    setTeardownStatus(['idle', 'idle', 'idle'])
   }, [scaleFactor])
 
   // Manual pipeline state
@@ -611,19 +620,18 @@ export default function DataprocTab() {
   }
 
   async function startManualPipelineStep(spec: typeof MANUAL_PIPELINE_SPECS[0]) {
-    const { loadType: lt, batchId: bid, stepIndex, label, clusterSuffix } = spec
-    const clName = `${clusterName}${clusterSuffix}`
+    const { loadType: lt, batchId: bid, stepIndex, label } = spec
     const cfg = stepConfigs[stepIndex]
 
     setManualRunId('pending')
     setManualActiveStep(stepIndex)
-    updateManualStep(stepIndex, { status: 'running', output: `${label} | ${cfg.workerType} x${cfg.numWorkers}, ${cfg.ssdCount} SSDs | Starting full cycle...` })
+    updateManualStep(stepIndex, { status: 'running', output: `${label} | ${cfg.clusterName} | ${cfg.workerType} x${cfg.numWorkers}, ${cfg.ssdCount} SSDs | Starting full cycle...` })
 
     try {
       const result = await apiCall('/api/dataproc/run-full-cycle', {
         method: 'POST',
         body: JSON.stringify({
-          cluster_name: clName,
+          cluster_name: cfg.clusterName,
           project, region, zone, subnet,
           metastore: metastoreMode === 'existing' ? metastore : (metastoreMode === 'create' ? `projects/${project}/locations/${region}/services/${metastoreName}` : ''),
           image_version: '2.3-debian12',
@@ -807,6 +815,30 @@ export default function DataprocTab() {
       addToast(`Failed to cancel: ${e.message}`, 'error')
     } finally {
       setManualCancelling(false)
+    }
+  }
+
+  // ── Manual cluster teardown ─────────────────────────────────────────
+  async function handleTeardownCluster(stepIdx: number) {
+    const cfg = stepConfigs[stepIdx]
+    setTeardownStatus(prev => prev.map((s, i) => i === stepIdx ? 'deleting' : s))
+    try {
+      const result = await apiCall('/api/dataproc/delete-cluster', {
+        method: 'POST',
+        body: JSON.stringify({
+          project, region, cluster_name: cfg.clusterName,
+        }),
+      })
+      if (result.status === 'deleted') {
+        setTeardownStatus(prev => prev.map((s, i) => i === stepIdx ? 'deleted' : s))
+        addToast(`Cluster ${cfg.clusterName} deleted`, 'success')
+      } else if (result.status === 'not_found') {
+        setTeardownStatus(prev => prev.map((s, i) => i === stepIdx ? 'not_found' : s))
+        addToast(`Cluster ${cfg.clusterName} not found (already deleted?)`, 'info')
+      }
+    } catch (e: any) {
+      setTeardownStatus(prev => prev.map((s, i) => i === stepIdx ? 'error' : s))
+      addToast(`Teardown failed: ${e.message}`, 'error')
     }
   }
 
@@ -1468,7 +1500,7 @@ export default function DataprocTab() {
 
           {/* Shared config row */}
           <div className="mb-5 p-4 bg-slate-50 rounded-lg border border-slate-200">
-            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
               <FormField label="Scale Factor">
                 <SelectInput
                   value={scaleFactor}
@@ -1479,9 +1511,6 @@ export default function DataprocTab() {
                     { value: '10000', label: 'SF 10000' },
                   ]}
                 />
-              </FormField>
-              <FormField label="Cluster Name (base)">
-                <TextInput value={clusterName} onChange={setClusterName} placeholder="tpcdi-cluster" />
               </FormField>
               <FormField label="Raw Data Path">
                 <TextInput value={rawDataPath} onChange={setRawDataPath} placeholder="gs://bucket/tpcdi" />
@@ -1522,6 +1551,7 @@ export default function DataprocTab() {
             {manualPipelineSteps.map((step, i) => {
               const cfg = stepConfigs[i]
               const isExpanded = expandedStepConfig === i
+              const tdStatus = teardownStatus[i]
               return (
               <div
                 key={i}
@@ -1546,11 +1576,12 @@ export default function DataprocTab() {
                       <div>
                         <span className="text-sm font-semibold text-slate-700">{step.name}</span>
                         <p className="text-[10px] text-slate-400 font-mono">
-                          {cfg.workerType} x{cfg.numWorkers} workers, {cfg.ssdCount} SSDs | {cfg.masterType} master
+                          <span className="text-slate-500">{cfg.clusterName}</span>
+                          {' | '}{cfg.workerType} x{cfg.numWorkers}, {cfg.ssdCount} SSDs, {cfg.masterType} master
                         </p>
                       </div>
                     </div>
-                    <div className="flex items-center gap-3">
+                    <div className="flex items-center gap-2">
                       {step.duration_ms !== null && (
                         <span className="text-xs font-mono text-slate-500">{formatDuration(step.duration_ms)}</span>
                       )}
@@ -1560,7 +1591,7 @@ export default function DataprocTab() {
                       {step.link && (
                         <a href={step.link} target="_blank" rel="noopener noreferrer"
                           className="text-xs text-blue-600 hover:text-blue-700 underline">
-                          View in GCP Console
+                          GCP Console
                         </a>
                       )}
                       <span className={`text-[10px] font-medium uppercase px-2 py-0.5 rounded ${
@@ -1571,12 +1602,32 @@ export default function DataprocTab() {
                       }`}>
                         {step.status}
                       </span>
-                      {step.status === 'pending' && !manualPipelineRunning && (
+                      {!manualPipelineRunning && (
                         <button
                           onClick={() => setExpandedStepConfig(isExpanded ? null : i)}
                           className="text-[10px] text-slate-400 hover:text-slate-600 underline"
                         >
-                          {isExpanded ? 'Hide Config' : 'Edit Config'}
+                          {isExpanded ? 'Hide' : 'Config'}
+                        </button>
+                      )}
+                      {/* Teardown button */}
+                      {(step.status === 'success' || step.status === 'error') && !manualPipelineRunning && (
+                        <button
+                          onClick={() => handleTeardownCluster(i)}
+                          disabled={tdStatus === 'deleting'}
+                          className={`text-[10px] font-medium px-2 py-0.5 rounded border transition-all ${
+                            tdStatus === 'deleting' ? 'bg-amber-50 border-amber-300 text-amber-600 animate-pulse' :
+                            tdStatus === 'deleted' ? 'bg-green-50 border-green-300 text-green-600' :
+                            tdStatus === 'not_found' ? 'bg-slate-50 border-slate-300 text-slate-500' :
+                            tdStatus === 'error' ? 'bg-red-50 border-red-300 text-red-600 hover:bg-red-100' :
+                            'bg-red-50 border-red-200 text-red-600 hover:bg-red-100 hover:border-red-300'
+                          }`}
+                        >
+                          {tdStatus === 'deleting' ? 'Deleting...' :
+                           tdStatus === 'deleted' ? 'Deleted' :
+                           tdStatus === 'not_found' ? 'Not Found' :
+                           tdStatus === 'error' ? 'Retry Teardown' :
+                           'Teardown Cluster'}
                         </button>
                       )}
                     </div>
@@ -1587,11 +1638,14 @@ export default function DataprocTab() {
                 </div>
 
                 {/* Expandable per-step cluster config */}
-                {isExpanded && step.status === 'pending' && !manualPipelineRunning && (
+                {isExpanded && !manualPipelineRunning && (
                   <div className="px-4 pb-4 pt-0">
                     <div className="ml-10 p-3 bg-white rounded-lg border border-slate-200">
                       <p className="text-[10px] text-slate-500 uppercase font-semibold mb-2">Cluster Configuration</p>
-                      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                      <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+                        <FormField label="Cluster Name">
+                          <TextInput value={cfg.clusterName} onChange={(v) => updateStepConfig(i, { clusterName: v })} placeholder="cluster-name" />
+                        </FormField>
                         <FormField label="Master Type">
                           <SelectInput value={cfg.masterType} onChange={(v) => updateStepConfig(i, { masterType: v })} options={gcpNodeTypes} />
                         </FormField>

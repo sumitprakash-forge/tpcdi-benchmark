@@ -932,6 +932,29 @@ async def cancel_dataproc_run(run_id: str):
     return {"status": "cancel_requested", "run_id": run_id}
 
 
+class DeleteClusterRequest(BaseModel):
+    project: str
+    region: str
+    cluster_name: str
+
+
+@router.post("/dataproc/delete-cluster")
+async def delete_cluster(req: DeleteClusterRequest):
+    """Delete a Dataproc cluster by name."""
+    cluster_client = _get_dataproc_client()
+    try:
+        op = cluster_client.delete_cluster(
+            request={"project_id": req.project, "region": req.region, "cluster_name": req.cluster_name}
+        )
+        await asyncio.get_event_loop().run_in_executor(None, lambda: op.result(timeout=300))
+        return {"status": "deleted", "cluster_name": req.cluster_name}
+    except Exception as e:
+        err = str(e)
+        if "404" in err or "NotFound" in err or "not found" in err.lower():
+            return {"status": "not_found", "cluster_name": req.cluster_name, "message": "Cluster does not exist"}
+        raise HTTPException(status_code=500, detail=f"Failed to delete cluster {req.cluster_name}: {err}")
+
+
 @router.get("/dataproc/run-cost")
 async def get_dataproc_run_cost(
     master_type: str = Query("n2d-standard-8"),
