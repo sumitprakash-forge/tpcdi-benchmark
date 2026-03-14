@@ -58,7 +58,11 @@ def get_auth_status() -> dict:
 
 
 def get_credentials() -> Optional[oauth2_credentials.Credentials]:
-    """Get valid Google credentials, refreshing if needed."""
+    """Get valid Google credentials, refreshing if needed.
+
+    Proactively refreshes tokens that will expire within 5 minutes to avoid
+    mid-request 401 errors from gRPC clients that cache the token at creation.
+    """
     global _cached_credentials
 
     if _cached_credentials is None:
@@ -68,7 +72,17 @@ def get_credentials() -> Optional[oauth2_credentials.Credentials]:
         return None
 
     try:
-        if _cached_credentials.expired or not _cached_credentials.token:
+        import datetime
+        _REFRESH_BUFFER = datetime.timedelta(minutes=5)
+        needs_refresh = (
+            not _cached_credentials.token
+            or _cached_credentials.expired
+            or (
+                _cached_credentials.expiry is not None
+                and _cached_credentials.expiry - datetime.datetime.utcnow() < _REFRESH_BUFFER
+            )
+        )
+        if needs_refresh:
             request = google.auth.transport.requests.Request()
             _cached_credentials.refresh(request)
     except Exception:

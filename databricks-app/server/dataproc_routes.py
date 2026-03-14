@@ -695,6 +695,30 @@ async def _run_full_cycle_task(run_id: str, req: DataprocFullRunRequest):
 
     run = _active_runs[run_id]
 
+    # Helper: get fresh clients with refreshed credentials before each phase.
+    # gRPC clients cache the auth token internally and do NOT call refresh()
+    # on the credentials object, so long-running tasks (>60 min) will hit 401
+    # unless we re-create clients with a freshly-refreshed token.
+    endpoint = f"{req.region}-dataproc.googleapis.com:443"
+
+    def _fresh_cluster_client():
+        creds = get_credentials()
+        if not creds:
+            raise RuntimeError("Google credentials expired or missing")
+        return dataproc_v1.ClusterControllerClient(
+            credentials=creds,
+            client_options={"api_endpoint": endpoint},
+        )
+
+    def _fresh_job_client():
+        creds = get_credentials()
+        if not creds:
+            raise RuntimeError("Google credentials expired or missing")
+        return dataproc_v1.JobControllerClient(
+            credentials=creds,
+            client_options={"api_endpoint": endpoint},
+        )
+
     try:
         creds = get_credentials()
         if not creds:
@@ -703,16 +727,8 @@ async def _run_full_cycle_task(run_id: str, req: DataprocFullRunRequest):
             run["phase"] = "failed"
             return
 
-        # Regional endpoint
-        endpoint = f"{req.region}-dataproc.googleapis.com:443"
-        cluster_client = dataproc_v1.ClusterControllerClient(
-            credentials=creds,
-            client_options={"api_endpoint": endpoint},
-        )
-        job_client = dataproc_v1.JobControllerClient(
-            credentials=creds,
-            client_options={"api_endpoint": endpoint},
-        )
+        cluster_client = _fresh_cluster_client()
+        job_client = _fresh_job_client()
 
         # ── Phase 1: Create Cluster ─────────────────────────────────
         run["phase"] = "creating_cluster"
@@ -786,6 +802,9 @@ async def _run_full_cycle_task(run_id: str, req: DataprocFullRunRequest):
         run["phase"] = "running_job"
         run["job_submitted_ms"] = int(time.time() * 1000)
 
+        # Refresh clients — cluster creation can take 5+ minutes
+        job_client = _fresh_job_client()
+
         # Build PySpark job
         script_args = [
             "--load-type", req.load_type,
@@ -824,9 +843,14 @@ async def _run_full_cycle_task(run_id: str, req: DataprocFullRunRequest):
         run["job_id"] = dp_job_id
 
         # Poll job until terminal
+        # Refresh clients every 30 min to avoid token expiry (tokens last ~60 min)
+        _last_client_refresh = time.time()
+        _REFRESH_INTERVAL = 30 * 60  # 30 minutes
+
         while True:
             if run_id in _cancelled_runs:
                 try:
+                    job_client = _fresh_job_client()
                     job_client.cancel_job(
                         request={"project_id": req.project, "region": req.region, "job_id": dp_job_id}
                     )
@@ -834,10 +858,21 @@ async def _run_full_cycle_task(run_id: str, req: DataprocFullRunRequest):
                     pass
                 run["state"] = "CANCELLED"
                 run["phase"] = "cancelled"
+                cluster_client = _fresh_cluster_client()
                 await _cleanup_cluster_api(cluster_client, req, run)
                 return
 
             await asyncio.sleep(15)
+
+            # Refresh gRPC clients periodically to get a fresh OAuth token
+            if time.time() - _last_client_refresh > _REFRESH_INTERVAL:
+                try:
+                    job_client = _fresh_job_client()
+                    cluster_client = _fresh_cluster_client()
+                    _last_client_refresh = time.time()
+                except Exception as refresh_err:
+                    print(f"[dataproc] WARNING: token refresh failed during poll: {refresh_err}")
+
             job_status = await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: job_client.get_job(
@@ -856,12 +891,14 @@ async def _run_full_cycle_task(run_id: str, req: DataprocFullRunRequest):
             run["state"] = "ERROR"
             run["error"] = f"Job {state}: {error_detail}"
             run["phase"] = "deleting_cluster"
+            cluster_client = _fresh_cluster_client()
             await _cleanup_cluster_api(cluster_client, req, run)
             run["phase"] = "failed"
             return
 
         # ── Phase 3: Delete Cluster ──────────────────────────────────
         run["phase"] = "deleting_cluster"
+        cluster_client = _fresh_cluster_client()
         await _cleanup_cluster_api(cluster_client, req, run)
         # cluster_deleted_ms is set by the helper on success; fall back to now
         # if deletion failed so that duration and cost are still calculated.
