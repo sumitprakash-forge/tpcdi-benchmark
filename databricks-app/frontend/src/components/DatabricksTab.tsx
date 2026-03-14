@@ -614,6 +614,7 @@ export default function DatabricksTab() {
       updateE2EStep(stepIndex, {
         status: 'running',
         output: `${runLabel} | Run ${runResult.run_id} started. Polling...`,
+        link: runResult.run_page_url || undefined,
       })
     } catch (e: any) {
       updateE2EStep(stepIndex, { status: 'error', output: `${runLabel} | ${e.message}` })
@@ -887,6 +888,7 @@ export default function DatabricksTab() {
       updateManualStep(stepIndex, {
         status: 'running',
         output: `Run ${runResult.run_id} started. Polling...`,
+        link: runResult.run_page_url || undefined,
       })
     } catch (e: any) {
       updateManualStep(stepIndex, { status: 'error', output: `Run start failed: ${e.message}` })
