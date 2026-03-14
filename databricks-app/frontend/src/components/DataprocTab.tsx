@@ -90,6 +90,29 @@ const E2E_RUN_SPECS: E2ERunSpec[] = [
   { loadType: 'incremental', batchId: '3', stepIndex: 3 },
 ]
 
+const MANUAL_PIPELINE_SPECS: { loadType: string; batchId: string; stepIndex: number; label: string; clusterSuffix: string }[] = [
+  { loadType: 'batch', batchId: '', stepIndex: 0, label: 'Batch Load', clusterSuffix: '-batch' },
+  { loadType: 'incremental', batchId: '2', stepIndex: 1, label: 'Incremental Load - Batch 2', clusterSuffix: '-inc-b2' },
+  { loadType: 'incremental', batchId: '3', stepIndex: 2, label: 'Incremental Load - Batch 3', clusterSuffix: '-inc-b3' },
+]
+
+interface ManualPipelineStep {
+  name: string
+  status: 'pending' | 'running' | 'success' | 'error'
+  output: string
+  duration_ms: number | null
+  link?: string
+}
+
+function buildManualPipelineSteps(): ManualPipelineStep[] {
+  return MANUAL_PIPELINE_SPECS.map(spec => ({
+    name: spec.label,
+    status: 'pending' as const,
+    output: '',
+    duration_ms: null,
+  }))
+}
+
 function getDataprocSizing(sf: number, loadType: string) {
   // Match sizing from run_tpcdi_cycle_dataproc_classic.sh
   if (loadType === 'batch') {
@@ -134,13 +157,16 @@ export default function DataprocTab() {
   const [workerType, setWorkerType] = useState('n2d-standard-8')
   const [numWorkers, setNumWorkers] = useState(3)
   const [ssdCount, setSsdCount] = useState(2)
-  const [loadType, setLoadType] = useState('batch')
   const [scaleFactor, setScaleFactor] = useState('1000')
-  const [batchId, setBatchId] = useState('')
 
-  // Manual run state
+  // Manual pipeline state
+  const [manualPipelineSteps, setManualPipelineSteps] = useState<ManualPipelineStep[]>(buildManualPipelineSteps())
+  const [manualPipelineRunning, setManualPipelineRunning] = useState(false)
+  const [manualActiveStep, setManualActiveStep] = useState<number | null>(null)
+  const [manualCosts, setManualCosts] = useState<(DataprocRunCost | null)[]>([null, null, null])
   const [manualRunId, setManualRunId] = useState<string | null>(null)
-  const [manualRunStatus, setManualRunStatus] = useState<DataprocRunStatus | null>(null)
+  const [manualRemainingSpecs, setManualRemainingSpecs] = useState<typeof MANUAL_PIPELINE_SPECS>([])
+  const manualCancelledRef = useRef(false)
 
   // Google auth state
   const [gcpAuth, setGcpAuth] = useState<{ status: string; method?: string; account?: string; message?: string } | null>(null)
@@ -174,7 +200,6 @@ export default function DataprocTab() {
   }, [e2eSteps, e2eSF, e2eRunId, e2eActiveStep, e2eRunning, runCosts, e2eRemainingSpecs])
 
   // Loading / Toast
-  const [loadingManualRun, setLoadingManualRun] = useState(false)
   const [toasts, setToasts] = useState<ToastMessage[]>([])
   const toastId = useRef(0)
 
@@ -546,15 +571,25 @@ export default function DataprocTab() {
     }
   }
 
-  // ── Manual mode handlers ─────────────────────────────────────────────
+  // ── Manual pipeline handlers ─────────────────────────────────────────
 
-  async function handleManualRun() {
-    setLoadingManualRun(true)
+  function updateManualStep(index: number, updates: Partial<ManualPipelineStep>) {
+    setManualPipelineSteps(prev => prev.map((s, i) => i === index ? { ...s, ...updates } : s))
+  }
+
+  async function startManualPipelineStep(spec: typeof MANUAL_PIPELINE_SPECS[0]) {
+    const { loadType: lt, batchId: bid, stepIndex, label, clusterSuffix } = spec
+    const clName = `${clusterName}${clusterSuffix}`
+
+    setManualRunId('pending')
+    setManualActiveStep(stepIndex)
+    updateManualStep(stepIndex, { status: 'running', output: `${label} | Starting full cycle (create cluster -> run job -> delete cluster)...` })
+
     try {
       const result = await apiCall('/api/dataproc/run-full-cycle', {
         method: 'POST',
         body: JSON.stringify({
-          cluster_name: clusterName,
+          cluster_name: clName,
           project, region, zone, subnet,
           metastore: metastoreMode === 'existing' ? metastore : (metastoreMode === 'create' ? `projects/${project}/locations/${region}/services/${metastoreName}` : ''),
           image_version: '2.3-debian12',
@@ -562,8 +597,8 @@ export default function DataprocTab() {
           worker_type: workerType,
           num_workers: numWorkers,
           ssd_count: ssdCount,
-          load_type: loadType,
-          batch_id: batchId,
+          load_type: lt,
+          batch_id: bid,
           scale_factor: parseInt(scaleFactor),
           gcs_bucket: gcsBucket,
           raw_data_path: rawDataPath,
@@ -572,34 +607,174 @@ export default function DataprocTab() {
         }),
       })
       setManualRunId(result.run_id)
-      addToast(`Dataproc run started: ${result.run_id}`, 'success')
+      updateManualStep(stepIndex, { output: `${label} | Run ${result.run_id} started. Polling...` })
     } catch (e: any) {
-      addToast(`Failed: ${e.message}`, 'error')
-    } finally {
-      setLoadingManualRun(false)
+      setManualRunId(null)
+      updateManualStep(stepIndex, { status: 'error', output: `${label} | ${e.message}` })
+      setManualPipelineRunning(false)
+      setManualRemainingSpecs([])
     }
   }
 
-  // Poll manual run status
+  // Polling useEffect for manual pipeline run
   useEffect(() => {
-    if (!manualRunId) return
+    if (!manualRunId || manualRunId === 'pending' || manualActiveStep === null) return
+    const stepIdx = manualActiveStep
+    const spec = MANUAL_PIPELINE_SPECS[stepIdx]
+    const label = spec?.label || `Step ${stepIdx + 1}`
+
+    const phaseIcon = (phase: string) => {
+      if (phase.includes('creating')) return 'Cluster provisioning'
+      if (phase.includes('running_job')) return 'Job executing'
+      if (phase.includes('deleting')) return 'Cluster teardown'
+      if (phase === 'completed') return 'Complete'
+      if (phase === 'failed') return 'Failed'
+      return phase.replace(/_/g, ' ')
+    }
+
     const poll = async () => {
       try {
-        const status = await apiCall(`/api/dataproc/run-status/${manualRunId}`)
-        setManualRunStatus(status)
-        if (status.state === 'DONE' || status.state === 'ERROR' || status.state === 'CANCELLED') {
+        const status: DataprocRunStatus = await apiCall(`/api/dataproc/run-status/${manualRunId}`)
+        const elapsed = status.start_time_ms
+          ? Date.now() - status.start_time_ms
+          : null
+
+        const parts: string[] = [label]
+        parts.push(`Phase: ${phaseIcon(status.phase)}`)
+        if (status.cluster_created_ms && status.start_time_ms) {
+          parts.push(`Cluster: ${formatDuration(status.cluster_created_ms - status.start_time_ms)}`)
+        }
+        if (status.job_submitted_ms && status.phase === 'running_job') {
+          const jobElapsed = Date.now() - status.job_submitted_ms
+          parts.push(`Job: ${formatDuration(jobElapsed)}`)
+        }
+        if (status.job_done_ms && status.job_submitted_ms) {
+          parts.push(`Job: ${formatDuration(status.job_done_ms - status.job_submitted_ms)}`)
+        }
+        if (elapsed) {
+          parts.push(`Total: ${formatDuration(elapsed)}`)
+        }
+
+        const gcpLink = status.job_id && status.config
+          ? `https://console.cloud.google.com/dataproc/jobs/${status.job_id}?project=${project}&region=${region}`
+          : status.cluster_name
+            ? `https://console.cloud.google.com/dataproc/clusters/${status.cluster_name}?project=${project}&region=${region}`
+            : undefined
+
+        updateManualStep(stepIdx, {
+          output: parts.join(' | '),
+          duration_ms: elapsed,
+          link: gcpLink,
+        })
+
+        if (status.state === 'DONE') {
+          const timingParts: string[] = [label, 'Done']
+          if (status.cluster_created_ms && status.start_time_ms) {
+            timingParts.push(`Cluster: ${formatDuration(status.cluster_created_ms - status.start_time_ms)}`)
+          }
+          if (status.job_done_ms && status.job_submitted_ms) {
+            timingParts.push(`Job: ${formatDuration(status.job_done_ms - status.job_submitted_ms)}`)
+          }
+          if (status.cluster_deleted_ms && status.job_done_ms) {
+            timingParts.push(`Teardown: ${formatDuration(status.cluster_deleted_ms - status.job_done_ms)}`)
+          }
+          timingParts.push(`Total: ${formatDuration(status.duration_ms)}`)
+          if (status.cost) {
+            timingParts.push(`Cost: $${status.cost.total_cost_usd.toFixed(2)}`)
+          }
+
+          const doneLink = status.job_id
+            ? `https://console.cloud.google.com/dataproc/jobs/${status.job_id}?project=${project}&region=${region}`
+            : undefined
+
+          updateManualStep(stepIdx, {
+            status: 'success',
+            output: timingParts.join(' | '),
+            duration_ms: status.duration_ms,
+            link: doneLink,
+          })
+          if (status.cost) {
+            setManualCosts(prev => {
+              const next = [...prev]
+              next[stepIdx] = status.cost
+              return next
+            })
+          }
+          setManualRunId(null)
+          return true
+        }
+
+        if (status.state === 'ERROR' || status.state === 'CANCELLED') {
+          updateManualStep(stepIdx, {
+            status: 'error',
+            output: `${label} | ${status.state}: ${status.error || 'Unknown error'}`,
+            duration_ms: elapsed,
+          })
+          setManualRunId(null)
+          setManualPipelineRunning(false)
+          setManualActiveStep(null)
+          setManualRemainingSpecs([])
           return true
         }
       } catch { /* ignore */ }
       return false
     }
-    poll()
+
+    poll().then((done) => { if (done) return })
     const interval = setInterval(async () => {
       const done = await poll()
       if (done) clearInterval(interval)
     }, 10000)
     return () => clearInterval(interval)
-  }, [manualRunId])
+  }, [manualRunId, manualActiveStep])
+
+  // Auto-continue: when a manual pipeline step completes, start next spec
+  useEffect(() => {
+    if (manualRunId !== null || !manualPipelineRunning || manualRemainingSpecs.length === 0) return
+    if (manualCancelledRef.current) {
+      setManualPipelineRunning(false)
+      setManualRemainingSpecs([])
+      return
+    }
+    const [next, ...rest] = manualRemainingSpecs
+    setManualRemainingSpecs(rest)
+    startManualPipelineStep(next)
+  }, [manualRunId, manualPipelineRunning, manualRemainingSpecs])
+
+  async function handleManualPipeline() {
+    const steps = buildManualPipelineSteps()
+    setManualPipelineSteps(steps)
+    setManualPipelineRunning(true)
+    setManualCosts([null, null, null])
+    setManualRunId(null)
+    setManualActiveStep(null)
+    setManualRemainingSpecs([])
+    manualCancelledRef.current = false
+
+    // Start the 3-step pipeline: batch first, then incremental 2, then 3
+    const [first, ...rest] = MANUAL_PIPELINE_SPECS
+    setManualRemainingSpecs(rest)
+    await startManualPipelineStep(first)
+  }
+
+  const [manualCancelling, setManualCancelling] = useState(false)
+
+  async function handleCancelManualPipeline() {
+    if (!manualRunId) return
+    setManualCancelling(true)
+    manualCancelledRef.current = true
+    try {
+      await apiCall(`/api/dataproc/cancel-run/${manualRunId}`, { method: 'POST' })
+      addToast(`Cancellation requested for run ${manualRunId}`, 'info')
+      if (manualActiveStep !== null) {
+        updateManualStep(manualActiveStep, { output: `Cancellation requested for run ${manualRunId}. Waiting...` })
+      }
+    } catch (e: any) {
+      addToast(`Failed to cancel: ${e.message}`, 'error')
+    } finally {
+      setManualCancelling(false)
+    }
+  }
 
   // ── Render ───────────────────────────────────────────────────────────
 
@@ -966,14 +1141,14 @@ export default function DataprocTab() {
       {/* ── Manual Mode ─────────────────────────────────────────────── */}
       {mode === 'manual' && (
         <>
-          <Section title="Dataproc Cluster & Job Configuration" defaultOpen={true} colorScheme="blue">
+          <Section title="Dataproc Cluster & Pipeline Configuration" defaultOpen={true} colorScheme="blue">
             <div className="pt-4">
               <div className="flex items-center gap-2 mb-5 p-3 bg-blue-50 border border-blue-200 rounded-lg">
                 <svg className="w-5 h-5 text-blue-500 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                 </svg>
                 <p className="text-sm text-blue-700">
-                  Full cycle: Create Cluster → Submit PySpark Job → Wait → Delete Cluster. Uses your gcloud auth.
+                  3-step pipeline: Batch Load → Incremental Batch 2 → Incremental Batch 3 (sequential, fail-fast). Each step creates its own cluster, runs the job, then deletes the cluster.
                 </p>
               </div>
 
@@ -1031,7 +1206,7 @@ export default function DataprocTab() {
               {/* Cluster Config */}
               <h4 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3">Cluster</h4>
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
-                <FormField label="Cluster Name">
+                <FormField label="Cluster Name (base)">
                   <TextInput value={clusterName} onChange={setClusterName} placeholder="tpcdi-cluster" />
                 </FormField>
                 <FormField label="Master Machine Type">
@@ -1048,19 +1223,9 @@ export default function DataprocTab() {
                 </FormField>
               </div>
 
-              {/* Job Config */}
+              {/* Job Config (no load_type / batch_id) */}
               <h4 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3">Job</h4>
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
-                <FormField label="Load Type">
-                  <SelectInput
-                    value={loadType}
-                    onChange={setLoadType}
-                    options={[
-                      { value: 'batch', label: 'Batch' },
-                      { value: 'incremental', label: 'Incremental' },
-                    ]}
-                  />
-                </FormField>
                 <FormField label="Scale Factor">
                   <SelectInput
                     value={scaleFactor}
@@ -1072,18 +1237,6 @@ export default function DataprocTab() {
                     ]}
                   />
                 </FormField>
-                {loadType === 'incremental' && (
-                  <FormField label="Batch ID">
-                    <SelectInput
-                      value={batchId}
-                      onChange={setBatchId}
-                      options={[
-                        { value: '2', label: 'Batch 2' },
-                        { value: '3', label: 'Batch 3' },
-                      ]}
-                    />
-                  </FormField>
-                )}
                 <FormField label="Raw Data Path">
                   <TextInput value={rawDataPath} onChange={setRawDataPath} placeholder="gs://bucket/tpcdi" />
                 </FormField>
@@ -1095,86 +1248,166 @@ export default function DataprocTab() {
                 </FormField>
               </div>
 
-              <div className="mt-5 pt-4 border-t border-slate-100">
+              {/* Pipeline preview */}
+              <div className="mb-4 p-3 bg-blue-50 border border-blue-200 rounded-lg">
+                <p className="text-xs font-semibold text-blue-700 mb-2">Pipeline steps (each creates & deletes its own cluster):</p>
+                <div className="flex flex-wrap gap-3 text-xs text-blue-600">
+                  {MANUAL_PIPELINE_SPECS.map((spec, i) => (
+                    <div key={i} className="bg-white/60 rounded px-2 py-1">
+                      <span className="font-medium">Step {i + 1}:</span> {spec.label} — cluster: <span className="font-mono">{clusterName}{spec.clusterSuffix}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="mt-5 pt-4 border-t border-slate-100 flex items-center gap-3">
                 <ActionButton
-                  label={loadingManualRun ? 'Starting...' : 'Run Full Cycle'}
-                  onClick={handleManualRun}
-                  loading={loadingManualRun}
+                  label={manualPipelineRunning ? 'Running Pipeline...' : 'Run Pipeline'}
+                  onClick={handleManualPipeline}
+                  loading={manualPipelineRunning}
+                  disabled={manualPipelineRunning}
                   variant="secondary"
                 />
+                {manualPipelineRunning && manualRunId && manualRunId !== 'pending' && (
+                  <button
+                    onClick={handleCancelManualPipeline}
+                    disabled={manualCancelling}
+                    className="px-4 py-2 text-sm font-medium rounded-md border border-red-300 text-red-600 hover:bg-red-50 disabled:opacity-50 transition-all"
+                  >
+                    {manualCancelling ? 'Cancelling...' : 'Cancel Run'}
+                  </button>
+                )}
               </div>
             </div>
           </Section>
 
-          {/* Manual Run Status */}
-          {manualRunStatus && (
-            <Section title="Run Status" defaultOpen={true} colorScheme="slate">
-              <div className="pt-4">
-                <div className={`p-4 rounded-lg border ${
-                  manualRunStatus.state === 'DONE' ? 'bg-green-50 border-green-300' :
-                  manualRunStatus.state === 'ERROR' ? 'bg-red-50 border-red-300' :
-                  'bg-blue-50 border-blue-300'
-                }`}>
-                  <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
-                    <div>
-                      <p className="text-[10px] text-slate-500 uppercase">Run ID</p>
-                      <p className="font-mono font-medium text-slate-700">{manualRunStatus.run_id}</p>
+          {/* Pipeline Step Progress */}
+          {(manualPipelineRunning || manualPipelineSteps.some(s => s.status !== 'pending')) && (
+            <Section title="Pipeline Progress" defaultOpen={true} colorScheme="slate">
+              <div className="pt-4 space-y-3">
+                {manualPipelineSteps.map((step, i) => (
+                  <div
+                    key={i}
+                    className={`p-4 rounded-lg border transition-all ${
+                      step.status === 'pending' ? 'bg-slate-50 border-slate-200' :
+                      step.status === 'running' ? 'bg-blue-50 border-blue-300 shadow-sm' :
+                      step.status === 'success' ? 'bg-green-50 border-green-300' :
+                      'bg-red-50 border-red-300'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-3">
+                        <span className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold ${
+                          step.status === 'pending' ? 'bg-slate-200 text-slate-500' :
+                          step.status === 'running' ? 'bg-blue-500 text-white animate-pulse' :
+                          step.status === 'success' ? 'bg-green-500 text-white' :
+                          'bg-red-500 text-white'
+                        }`}>
+                          {step.status === 'success' ? '\u2713' : step.status === 'error' ? '!' : i + 1}
+                        </span>
+                        <span className="text-sm font-semibold text-slate-700">{step.name}</span>
+                      </div>
+                      <div className="flex items-center gap-3">
+                        {step.duration_ms !== null && (
+                          <span className="text-xs font-mono text-slate-500">{formatDuration(step.duration_ms)}</span>
+                        )}
+                        <span className={`text-[10px] font-medium uppercase px-2 py-0.5 rounded ${
+                          step.status === 'pending' ? 'bg-slate-200 text-slate-500' :
+                          step.status === 'running' ? 'bg-blue-100 text-blue-700' :
+                          step.status === 'success' ? 'bg-green-100 text-green-700' :
+                          'bg-red-100 text-red-700'
+                        }`}>
+                          {step.status}
+                        </span>
+                      </div>
                     </div>
-                    <div>
-                      <p className="text-[10px] text-slate-500 uppercase">State</p>
-                      <span className={`inline-block px-2 py-0.5 rounded text-xs font-medium ${
-                        manualRunStatus.state === 'DONE' ? 'bg-green-100 text-green-700' :
-                        manualRunStatus.state === 'ERROR' ? 'bg-red-100 text-red-700' :
-                        manualRunStatus.state === 'CANCELLED' ? 'bg-yellow-100 text-yellow-700' :
-                        'bg-blue-100 text-blue-700'
-                      }`}>
-                        {manualRunStatus.state}
-                      </span>
-                    </div>
-                    <div>
-                      <p className="text-[10px] text-slate-500 uppercase">Phase</p>
-                      <p className="font-medium text-slate-700 capitalize">{manualRunStatus.phase.replace(/_/g, ' ')}</p>
-                    </div>
-                    <div>
-                      <p className="text-[10px] text-slate-500 uppercase">Duration</p>
-                      <p className="font-mono font-medium text-slate-700">{formatDuration(manualRunStatus.duration_ms)}</p>
-                    </div>
+                    {step.output && (
+                      <p className="mt-2 text-xs text-slate-600 ml-10 break-words">{step.output}</p>
+                    )}
+                    {step.link && (
+                      <a href={step.link} target="_blank" rel="noopener noreferrer"
+                        className="mt-1 ml-10 inline-block text-xs text-blue-600 hover:text-blue-700 underline">
+                        View in GCP Console
+                      </a>
+                    )}
                   </div>
-                  {manualRunStatus.error && (
-                    <p className="mt-3 text-xs text-red-600">{manualRunStatus.error}</p>
-                  )}
-                </div>
-
-                {/* Manual cost display */}
-                {manualRunStatus.cost && (
-                  <div className="mt-4 p-4 bg-gradient-to-r from-slate-50 to-blue-50 rounded-lg border border-slate-200">
-                    <h4 className="text-sm font-bold text-slate-700 mb-3">Cost Breakdown</h4>
-                    <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-                      <div className="bg-white rounded-lg p-2.5 border border-slate-100">
-                        <p className="text-[10px] text-slate-500 uppercase">VM Compute</p>
-                        <p className="text-base font-bold text-slate-800">{formatCost(manualRunStatus.cost.vm_cost_usd)}</p>
-                      </div>
-                      <div className="bg-white rounded-lg p-2.5 border border-slate-100">
-                        <p className="text-[10px] text-slate-500 uppercase">Dataproc Premium</p>
-                        <p className="text-base font-bold text-slate-800">{formatCost(manualRunStatus.cost.dataproc_premium_usd)}</p>
-                      </div>
-                      <div className="bg-white rounded-lg p-2.5 border border-slate-100">
-                        <p className="text-[10px] text-slate-500 uppercase">Local SSD</p>
-                        <p className="text-base font-bold text-slate-800">{formatCost(manualRunStatus.cost.ssd_cost_usd)}</p>
-                      </div>
-                      <div className="bg-white rounded-lg p-2.5 border border-blue-200 bg-blue-50">
-                        <p className="text-[10px] text-blue-600 uppercase font-semibold">Total</p>
-                        <p className="text-base font-bold text-blue-700">{formatCost(manualRunStatus.cost.total_cost_usd)}</p>
-                      </div>
-                      <div className="bg-white rounded-lg p-2.5 border border-slate-100">
-                        <p className="text-[10px] text-slate-500 uppercase">Duration</p>
-                        <p className="text-sm font-mono text-slate-700">{formatDuration(manualRunStatus.cost.duration_ms)}</p>
-                        <p className="text-[9px] text-slate-400">{manualRunStatus.cost.cluster.worker_type} x{manualRunStatus.cost.cluster.num_workers}</p>
-                      </div>
-                    </div>
-                  </div>
-                )}
+                ))}
               </div>
+
+              {/* Cost Breakdown */}
+              {manualCosts.some(c => c !== null) && (
+                <div className="mt-6 space-y-4">
+                  {(() => {
+                    const totalCost = manualCosts.reduce((sum, c) => sum + (c?.total_cost_usd || 0), 0)
+                    const totalDuration = manualCosts.reduce((sum, c) => sum + (c?.duration_ms || 0), 0)
+                    return (
+                      <div className="p-4 bg-gradient-to-r from-blue-50 to-cyan-50 rounded-lg border border-blue-200">
+                        <div className="flex items-center justify-between">
+                          <h4 className="text-sm font-bold text-blue-800">Pipeline Total</h4>
+                          <div className="flex items-center gap-6">
+                            <div className="text-right">
+                              <p className="text-[10px] text-blue-600 uppercase">Total Cost</p>
+                              <p className="text-xl font-bold text-blue-700">{formatCost(totalCost)}</p>
+                            </div>
+                            <div className="text-right">
+                              <p className="text-[10px] text-blue-600 uppercase">Total Duration</p>
+                              <p className="text-xl font-bold text-blue-700">{formatDuration(totalDuration)}</p>
+                            </div>
+                            {totalDuration > 0 && (
+                              <div className="text-right">
+                                <p className="text-[10px] text-blue-600 uppercase">Avg $/hr</p>
+                                <p className="text-xl font-bold text-blue-700">
+                                  ${(totalCost / (totalDuration / 3_600_000)).toFixed(2)}
+                                </p>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    )
+                  })()}
+                  {manualCosts.map((cost, ci) => {
+                    if (!cost) return null
+                    const labels = ['Batch Load', 'Incremental Load - Batch 2', 'Incremental Load - Batch 3']
+                    return (
+                      <div key={ci} className="p-4 bg-gradient-to-r from-slate-50 to-blue-50 rounded-lg border border-slate-200">
+                        <div className="flex items-center justify-between mb-3">
+                          <h4 className="text-sm font-bold text-slate-700">{labels[ci]} (SF {scaleFactor})</h4>
+                          {cost.duration_hours > 0 && (
+                            <span className="text-[10px] text-slate-400 font-mono">
+                              ${(cost.total_cost_usd / cost.duration_hours).toFixed(2)}/hr
+                            </span>
+                          )}
+                        </div>
+                        <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+                          <div className="bg-white rounded-lg p-2.5 border border-slate-100">
+                            <p className="text-[10px] text-slate-500 uppercase">VM Compute</p>
+                            <p className="text-base font-bold text-slate-800">{formatCost(cost.vm_cost_usd)}</p>
+                          </div>
+                          <div className="bg-white rounded-lg p-2.5 border border-slate-100">
+                            <p className="text-[10px] text-slate-500 uppercase">Dataproc Premium</p>
+                            <p className="text-base font-bold text-slate-800">{formatCost(cost.dataproc_premium_usd)}</p>
+                          </div>
+                          <div className="bg-white rounded-lg p-2.5 border border-slate-100">
+                            <p className="text-[10px] text-slate-500 uppercase">Local SSD</p>
+                            <p className="text-base font-bold text-slate-800">{formatCost(cost.ssd_cost_usd)}</p>
+                            <p className="text-[9px] text-slate-400">{cost.cluster.ssd_count} SSD(s)</p>
+                          </div>
+                          <div className="bg-white rounded-lg p-2.5 border border-blue-200 bg-blue-50">
+                            <p className="text-[10px] text-blue-600 uppercase font-semibold">Total</p>
+                            <p className="text-base font-bold text-blue-700">{formatCost(cost.total_cost_usd)}</p>
+                          </div>
+                          <div className="bg-white rounded-lg p-2.5 border border-slate-100">
+                            <p className="text-[10px] text-slate-500 uppercase">Duration</p>
+                            <p className="text-sm font-mono text-slate-700">{formatDuration(cost.duration_ms)}</p>
+                            <p className="text-[9px] text-slate-400">{cost.cluster.worker_type} x{cost.cluster.num_workers}</p>
+                          </div>
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
             </Section>
           )}
         </>

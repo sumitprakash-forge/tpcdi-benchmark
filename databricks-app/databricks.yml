@@ -1,0 +1,34 @@
+bundle:
+  name: tpcdi-benchmark
+
+variables:
+  workspace_host:
+    description: "Databricks workspace host (e.g. adb-1234567890.8.azuredatabricks.net)"
+    default: ""
+
+resources:
+  apps:
+    tpcdi-benchmark:
+      name: "tpcdi-benchmark"
+      description: "TPC-DI Benchmark Runner - Databricks & Dataproc ETL orchestration"
+      source_code_path: .
+      config:
+        command:
+          - python
+          - app.py
+        env:
+          - name: NODE_ENV
+            value: production
+      permissions:
+        - level: CAN_MANAGE
+          user_name: ${workspace.current_user.userName}
+
+targets:
+  dev:
+    mode: development
+    workspace:
+      host: https://${var.workspace_host}
+
+  prod:
+    workspace:
+      host: https://${var.workspace_host}

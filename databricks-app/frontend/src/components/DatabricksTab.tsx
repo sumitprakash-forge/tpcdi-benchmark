@@ -52,6 +52,7 @@ interface JobInfo {
 
 const STORAGE_KEY = 'tpcdi_databricks_job_id'
 const E2E_STATE_KEY = 'tpcdi_e2e_state'
+const MANUAL_STATE_KEY = 'tpcdi_manual_pipeline_state'
 
 interface E2EPersistedState {
   steps: E2EStep[]
@@ -189,6 +190,47 @@ const E2E_RUN_SPECS: E2ERunSpec[] = [
   { loadType: 'incremental', batchId: '3', stepIndex: 3 },
 ]
 
+interface ManualPipelineStep {
+  name: string
+  status: 'pending' | 'running' | 'success' | 'error'
+  output: string
+  duration_ms: number | null
+  link?: string
+}
+
+interface ManualPipelineSpec {
+  loadType: string
+  batchId: string
+  stepIndex: number
+  jobName: string
+}
+
+interface ManualPipelinePersistedState {
+  steps: ManualPipelineStep[]
+  running: boolean
+  activeStep: number | null
+  runId: number | null
+  costs: (RunCost | null)[]
+  remainingSpecs: ManualPipelineSpec[]
+  sf: string
+}
+
+function buildManualPipelineSteps(sf: string): ManualPipelineStep[] {
+  return [
+    { name: `Batch Load (SF ${sf})`, status: 'pending', output: '', duration_ms: null },
+    { name: `Incremental Load - Batch 2 (SF ${sf})`, status: 'pending', output: '', duration_ms: null },
+    { name: `Incremental Load - Batch 3 (SF ${sf})`, status: 'pending', output: '', duration_ms: null },
+  ]
+}
+
+function buildManualPipelineSpecs(sf: string): ManualPipelineSpec[] {
+  return [
+    { loadType: 'batch', batchId: '', stepIndex: 0, jobName: `TPC-DI Benchmark - Batch SF${sf}` },
+    { loadType: 'incremental', batchId: '2', stepIndex: 1, jobName: `TPC-DI Benchmark - Inc B2 SF${sf}` },
+    { loadType: 'incremental', batchId: '3', stepIndex: 2, jobName: `TPC-DI Benchmark - Inc B3 SF${sf}` },
+  ]
+}
+
 export default function DatabricksTab() {
   // Mode toggle
   const [mode, setMode] = useState<'e2e' | 'manual'>('e2e')
@@ -203,11 +245,11 @@ export default function DatabricksTab() {
   const [fixingGcsIam, setFixingGcsIam] = useState(false)
 
   // Benchmark config state
-  const [loadType, setLoadType] = useState('batch')
+  const [loadType, _setLoadType] = useState('batch')
   const [scaleFactor, setScaleFactor] = useState('10')
   const [targetCatalog, setTargetCatalog] = useState('gcp_tpcdi_sandbox')
   const [targetSchema, setTargetSchema] = useState('dw')
-  const [batchId, setBatchId] = useState('')
+  const [_batchId, _setBatchId] = useState('')
   const [cloud, setCloud] = useState('GCP')
   const [xmlFormat, setXmlFormat] = useState('com.databricks.spark.xml')
   const [sparkVersion, setSparkVersion] = useState('17.3.x-scala2.13')
@@ -277,17 +319,17 @@ export default function DatabricksTab() {
   }, [loadType, scaleFactor])
 
   // Run state - restore jobId from localStorage
-  const [jobId, setJobId] = useState<number | null>(() => {
+  const [jobId, _setJobId] = useState<number | null>(() => {
     const saved = localStorage.getItem(STORAGE_KEY)
     return saved ? parseInt(saved, 10) : null
   })
   const [runId, setRunId] = useState<number | null>(null)
   const [jobStatus, setJobStatus] = useState<JobStatus | null>(null)
-  const [jobRuns, setJobRuns] = useState<RunInfo[]>([])
-  const [loadingRuns, setLoadingRuns] = useState(false)
-  const [availableJobs, setAvailableJobs] = useState<JobInfo[]>([])
-  const [loadingJobs, setLoadingJobs] = useState(false)
-  const [manualJobId, setManualJobId] = useState('')
+  const [_jobRuns, setJobRuns] = useState<RunInfo[]>([])
+  const [_loadingRuns, setLoadingRuns] = useState(false)
+  const [_availableJobs, setAvailableJobs] = useState<JobInfo[]>([])
+  const [_loadingJobs, setLoadingJobs] = useState(false)
+  const [_manualJobId, _setManualJobId] = useState('')
 
   // End-to-End state - restore from localStorage
   const savedE2E = useRef<E2EPersistedState | null>((() => {
@@ -304,6 +346,22 @@ export default function DatabricksTab() {
   const [runCosts, setRunCosts] = useState<(RunCost | null)[]>(savedE2E.current?.costs || [null, null, null])
   const [e2eRemainingSpecs, setE2eRemainingSpecs] = useState<E2ERunSpec[]>(savedE2E.current?.remainingSpecs || [])
   const benchmarkNotebookPath = useRef<string>('')
+
+  // Manual pipeline state - restore from localStorage
+  const savedManual = useRef<ManualPipelinePersistedState | null>((() => {
+    try {
+      const raw = localStorage.getItem(MANUAL_STATE_KEY)
+      return raw ? JSON.parse(raw) : null
+    } catch { return null }
+  })())
+  const [manualSteps, setManualSteps] = useState<ManualPipelineStep[]>(savedManual.current?.steps || buildManualPipelineSteps('10'))
+  const [manualRunning, setManualRunning] = useState(savedManual.current?.running || false)
+  const [manualActiveStep, setManualActiveStep] = useState<number | null>(savedManual.current?.activeStep ?? null)
+  const [manualRunId, setManualRunId] = useState<number | null>(savedManual.current?.runId ?? null)
+  const [manualCosts, setManualCosts] = useState<(RunCost | null)[]>(savedManual.current?.costs || [null, null, null])
+  const [manualRemainingSpecs, setManualRemainingSpecs] = useState<ManualPipelineSpec[]>(savedManual.current?.remainingSpecs || [])
+  const manualCancelledRef = useRef(false)
+  const manualStartingRef = useRef(false)
 
   // Persist jobId to localStorage
   useEffect(() => {
@@ -328,9 +386,19 @@ export default function DatabricksTab() {
     localStorage.setItem(E2E_STATE_KEY, JSON.stringify(state))
   }, [e2eSteps, e2eSF, e2eRunId, e2eActiveStep, e2eRunning, runCosts, e2eRemainingSpecs])
 
-  // Loading states
-  const [loadingJob, setLoadingJob] = useState(false)
-  const [loadingRun, setLoadingRun] = useState(false)
+  // Persist manual pipeline state to localStorage
+  useEffect(() => {
+    const state: ManualPipelinePersistedState = {
+      steps: manualSteps,
+      running: manualRunning,
+      activeStep: manualActiveStep,
+      runId: manualRunId,
+      costs: manualCosts,
+      remainingSpecs: manualRemainingSpecs,
+      sf: scaleFactor,
+    }
+    localStorage.setItem(MANUAL_STATE_KEY, JSON.stringify(state))
+  }, [manualSteps, manualRunning, manualActiveStep, manualRunId, manualCosts, manualRemainingSpecs, scaleFactor])
 
   // Toast state
   const [toasts, setToasts] = useState<ToastMessage[]>([])
@@ -473,71 +541,6 @@ export default function DatabricksTab() {
 
   // ── Job Actions ──────────────────────────────────────────────────────────
 
-  async function handleCreateJob() {
-    setLoadingJob(true)
-    try {
-      const result = await apiCall('/api/databricks/create-job', {
-        method: 'POST',
-        body: JSON.stringify({
-          job_name: `TPC-DI Benchmark SF${scaleFactor} ${loadType}`,
-          load_type: loadType,
-          scale_factor: parseInt(scaleFactor),
-          raw_data_path: rawDataPath,
-          catalog: targetCatalog,
-          schema_name: targetSchema,
-          batch_id: batchId || '',
-          cloud,
-          xml_format: xmlFormat,
-          spark_version: sparkVersion,
-          worker_node_type: workerNodeType,
-          driver_node_type: driverNodeType,
-          num_workers: numWorkers,
-          jar_path: effectiveJarPath,
-          photon,
-          local_ssds: localSsds,
-          log_detailed_stats: logDetailedStats,
-          job_id: jobId,
-        }),
-      })
-      setJobId(result.job_id)
-      addToast(`Job ${result.action}: ID ${result.job_id}`, 'success')
-    } catch (e: any) {
-      addToast(`Failed to create/update job: ${e.message}`, 'error')
-    } finally {
-      setLoadingJob(false)
-    }
-  }
-
-  async function handleRunBenchmark() {
-    if (!jobId) {
-      addToast('Create a job first', 'error')
-      return
-    }
-    setLoadingRun(true)
-    try {
-      const result = await apiCall('/api/databricks/run-job', {
-        method: 'POST',
-        body: JSON.stringify({ job_id: jobId }),
-      })
-      setRunId(result.run_id)
-      addToast(`Benchmark started: Run ID ${result.run_id}`, 'success')
-      // Refresh run list
-      setTimeout(() => loadJobRuns(jobId), 2000)
-    } catch (e: any) {
-      addToast(`Failed to start benchmark: ${e.message}`, 'error')
-    } finally {
-      setLoadingRun(false)
-    }
-  }
-
-  function handleLoadJobId() {
-    const parsed = parseInt(manualJobId, 10)
-    if (parsed) {
-      setJobId(parsed)
-      setManualJobId('')
-      addToast(`Loaded job ID: ${parsed}`, 'info')
-    }
-  }
 
   // ── End-to-End Run ─────────────────────────────────────────────────────
 
@@ -810,6 +813,182 @@ export default function DatabricksTab() {
     }
   }
 
+  // ── Manual Pipeline ────────────────────────────────────────────────────
+
+  function updateManualStep(index: number, updates: Partial<ManualPipelineStep>) {
+    setManualSteps(prev => prev.map((s, i) => i === index ? { ...s, ...updates } : s))
+  }
+
+  async function startManualRunSpec(spec: ManualPipelineSpec) {
+    manualStartingRef.current = true
+    const { loadType: lt, batchId: bid, stepIndex, jobName } = spec
+
+    setManualActiveStep(stepIndex)
+    updateManualStep(stepIndex, { status: 'running', output: `Creating job "${jobName}"...` })
+
+    let createdJobId: number | null = null
+    try {
+      const jobResult = await apiCall('/api/databricks/create-job', {
+        method: 'POST',
+        body: JSON.stringify({
+          job_name: jobName,
+          load_type: lt,
+          scale_factor: parseInt(scaleFactor),
+          raw_data_path: rawDataPath,
+          catalog: targetCatalog,
+          schema_name: targetSchema,
+          batch_id: bid,
+          cloud,
+          xml_format: xmlFormat,
+          spark_version: sparkVersion,
+          worker_node_type: workerNodeType,
+          driver_node_type: driverNodeType,
+          num_workers: numWorkers,
+          jar_path: effectiveJarPath,
+          photon,
+          local_ssds: localSsds,
+          log_detailed_stats: logDetailedStats,
+        }),
+      })
+      createdJobId = jobResult.job_id
+      updateManualStep(stepIndex, { output: `Job ${jobResult.action} (ID: ${jobResult.job_id}). Starting run...` })
+    } catch (e: any) {
+      updateManualStep(stepIndex, { status: 'error', output: `Job creation failed: ${e.message}` })
+      setManualRunning(false)
+      setManualRemainingSpecs([])
+      manualStartingRef.current = false
+      return
+    }
+
+    try {
+      const runResult = await apiCall('/api/databricks/run-job', {
+        method: 'POST',
+        body: JSON.stringify({ job_id: createdJobId }),
+      })
+      setManualRunId(runResult.run_id)
+      updateManualStep(stepIndex, {
+        status: 'running',
+        output: `Run ${runResult.run_id} started. Polling...`,
+      })
+    } catch (e: any) {
+      updateManualStep(stepIndex, { status: 'error', output: `Run start failed: ${e.message}` })
+      setManualRunning(false)
+      setManualRemainingSpecs([])
+    }
+    manualStartingRef.current = false
+  }
+
+  // Manual pipeline polling
+  useEffect(() => {
+    if (!manualRunId || manualActiveStep === null) return
+    const stepIdx = manualActiveStep
+
+    const poll = async () => {
+      try {
+        const status = await apiCall(`/api/databricks/job-status/${manualRunId}`)
+        const stateStr = status.result_state
+          ? `${status.state} (${status.result_state})`
+          : status.state
+
+        updateManualStep(stepIdx, {
+          output: `Status: ${stateStr}. Setup: ${formatDuration(status.setup_duration)}, Exec: ${formatDuration(status.execution_duration)}`,
+          link: status.run_page_url || undefined,
+          duration_ms: (status.execution_duration || 0) + (status.setup_duration || 0),
+        })
+
+        const terminal = status.state === 'TERMINATED' || status.state === 'SKIPPED' || status.state === 'INTERNAL_ERROR'
+        if (terminal) {
+          const isSuccess = status.state === 'TERMINATED' && status.result_state === 'SUCCESS'
+          updateManualStep(stepIdx, {
+            status: isSuccess ? 'success' : 'error',
+            output: `${stateStr}. Setup: ${formatDuration(status.setup_duration)}, Exec: ${formatDuration(status.execution_duration)}${status.state_message ? ' - ' + status.state_message : ''}`,
+            link: status.run_page_url || undefined,
+            duration_ms: (status.execution_duration || 0) + (status.setup_duration || 0),
+          })
+          if (isSuccess) {
+            try {
+              const costData = await apiCall(`/api/databricks/run-cost/${manualRunId}`)
+              setManualCosts(prev => {
+                const next = [...prev]
+                next[stepIdx] = costData
+                return next
+              })
+            } catch { /* ignore */ }
+          }
+          setManualRunId(null)
+          if (!isSuccess) {
+            setManualRunning(false)
+            setManualActiveStep(null)
+            setManualRemainingSpecs([])
+          }
+          return true
+        }
+      } catch { /* ignore */ }
+      return false
+    }
+
+    poll().then((done) => { if (done) return })
+    const interval = setInterval(async () => {
+      const done = await poll()
+      if (done) clearInterval(interval)
+    }, 10000)
+    return () => clearInterval(interval)
+  }, [manualRunId, manualActiveStep])
+
+  // Manual pipeline auto-continue
+  useEffect(() => {
+    if (manualRunId !== null || !manualRunning) return
+    if (manualCancelledRef.current) {
+      setManualRunning(false)
+      setManualRemainingSpecs([])
+      return
+    }
+    if (manualRemainingSpecs.length === 0) {
+      setManualRunning(false)
+      setManualActiveStep(null)
+      return
+    }
+    if (manualStartingRef.current) return
+    const [next, ...rest] = manualRemainingSpecs
+    setManualRemainingSpecs(rest)
+    startManualRunSpec(next)
+  }, [manualRunId, manualRunning, manualRemainingSpecs])
+
+  async function handleManualPipeline() {
+    const steps = buildManualPipelineSteps(scaleFactor)
+    setManualSteps(steps)
+    setManualRunning(true)
+    setManualCosts([null, null, null])
+    setManualRunId(null)
+    setManualActiveStep(null)
+    setManualRemainingSpecs([])
+    manualCancelledRef.current = false
+
+    const specs = buildManualPipelineSpecs(scaleFactor)
+    const [first, ...rest] = specs
+    setManualRemainingSpecs(rest)
+    await startManualRunSpec(first)
+  }
+
+  const [manualCancelling, setManualCancelling] = useState(false)
+
+  async function handleCancelManualPipeline() {
+    if (!manualRunId) return
+    setManualCancelling(true)
+    manualCancelledRef.current = true
+    try {
+      await apiCall(`/api/databricks/cancel-run/${manualRunId}`, { method: 'POST' })
+      addToast(`Run ${manualRunId} cancellation requested`, 'info')
+      if (manualActiveStep !== null) {
+        updateManualStep(manualActiveStep, { output: `Cancellation requested for run ${manualRunId}. Waiting for confirmation...` })
+      }
+    } catch (e: any) {
+      addToast(`Failed to cancel: ${e.message}`, 'error')
+    } finally {
+      setManualCancelling(false)
+    }
+  }
+
   function formatCost(usd: number) {
     return `$${usd.toFixed(4)}`
   }
@@ -868,28 +1047,6 @@ export default function DatabricksTab() {
     if (hours > 0) return `${hours}h ${minutes % 60}m ${seconds % 60}s`
     if (minutes > 0) return `${minutes}m ${seconds % 60}s`
     return `${seconds}s`
-  }
-
-  function formatTimestamp(ts: number | null | undefined) {
-    if (!ts) return '--'
-    return new Date(ts).toLocaleString()
-  }
-
-  function stateColor(state: string, resultState: string | null | undefined) {
-    if (state === 'TERMINATED' && resultState === 'SUCCESS') return 'bg-green-100 text-green-700'
-    if (state === 'TERMINATED') return 'bg-red-100 text-red-700'
-    if (state === 'RUNNING') return 'bg-blue-100 text-blue-700'
-    if (state === 'PENDING' || state === 'QUEUED') return 'bg-yellow-100 text-yellow-700'
-    if (state === 'SKIPPED') return 'bg-slate-100 text-slate-600'
-    if (state === 'INTERNAL_ERROR') return 'bg-red-100 text-red-700'
-    return 'bg-slate-100 text-slate-600'
-  }
-
-  function stateLabel(state: string, resultState: string | null | undefined) {
-    if (state === 'TERMINATED' && resultState === 'SUCCESS') return 'SUCCESS'
-    if (state === 'TERMINATED') return resultState || 'FAILED'
-    if (state === 'INTERNAL_ERROR') return 'ERROR'
-    return state
   }
 
   return (
@@ -1243,26 +1400,7 @@ export default function DatabricksTab() {
       {/* Benchmark Configuration Section - visible only when prerequisites are ready */}
       {prereqCheck?.status === 'ready' && (
       <Section title="2. Benchmark Configuration" colorScheme="amber">
-        {/* Sizing Suggestion Banner */}
-        {sizingConfig && (
-          <div className="mt-4 p-3 bg-amber-50 border border-amber-200 rounded-lg">
-            <p className="text-sm text-amber-800">
-              <span className="font-semibold">Auto-sized for {loadType} SF={scaleFactor} ({sizingConfig.label}):</span>{' '}
-              Driver <span className="font-mono">{sizingConfig.driver}</span>, Worker <span className="font-mono">{sizingConfig.worker}</span>, {sizingConfig.workers} workers
-            </p>
-          </div>
-        )}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 pt-4">
-          <FormField label="Load Type">
-            <SelectInput
-              value={loadType}
-              onChange={setLoadType}
-              options={[
-                { value: 'batch', label: 'Batch (Historical Load)' },
-                { value: 'incremental', label: 'Incremental' },
-              ]}
-            />
-          </FormField>
           <FormField label="Scale Factor">
             <SelectInput
               value={scaleFactor}
@@ -1275,18 +1413,6 @@ export default function DatabricksTab() {
               ]}
             />
           </FormField>
-          {loadType === 'incremental' && (
-            <FormField label="Batch ID" hint="Incremental batch: 2 or 3">
-              <SelectInput
-                value={batchId}
-                onChange={setBatchId}
-                options={[
-                  { value: '2', label: 'Batch 2' },
-                  { value: '3', label: 'Batch 3' },
-                ]}
-              />
-            </FormField>
-          )}
           <FormField label="Target Catalog" hint="Set in Prerequisites">
             <div className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-md text-sm font-mono text-slate-700">{targetCatalog}</div>
           </FormField>
@@ -1357,225 +1483,151 @@ export default function DatabricksTab() {
       </Section>
       )}
 
-      {/* Run Section - visible only when prerequisites are ready */}
+      {/* Pipeline Run Section - visible only when prerequisites are ready */}
       {prereqCheck?.status === 'ready' && (
-      <Section title="3. Run Benchmark" defaultOpen={true} colorScheme="blue">
+      <Section title="3. Run Pipeline" defaultOpen={true} colorScheme="blue">
         <div className="pt-4">
-          {/* Job selector / loader */}
-          <div className="flex flex-wrap gap-3 items-center mb-4">
-            <ActionButton label={jobId ? 'Update Job' : 'Create Job'} onClick={handleCreateJob} loading={loadingJob} />
+          {/* Pipeline info and controls */}
+          <div className="flex flex-wrap items-end gap-4 mb-6">
+            <div className="text-sm text-slate-600">
+              <span className="font-semibold">3-Step Pipeline:</span> Batch Load &rarr; Incremental Batch 2 &rarr; Incremental Batch 3 (SF {scaleFactor})
+            </div>
             <ActionButton
-              label="Run Benchmark"
-              onClick={handleRunBenchmark}
-              loading={loadingRun}
-              disabled={!jobId}
-              variant="secondary"
+              label={manualRunning ? 'Running...' : 'Run Pipeline'}
+              onClick={handleManualPipeline}
+              loading={manualRunning}
+              disabled={manualRunning}
             />
-            {jobId && (
-              <span className="text-sm text-slate-500">
-                Job ID: <span className="font-mono font-medium text-slate-700">{jobId}</span>
-                <button
-                  onClick={() => { setJobId(null); setRunId(null); setJobStatus(null); setJobRuns([]) }}
-                  className="ml-2 text-xs text-red-400 hover:text-red-600"
-                  title="Clear job"
-                >
-                  clear
-                </button>
-              </span>
+            {manualRunning && manualRunId && (
+              <button
+                onClick={handleCancelManualPipeline}
+                disabled={manualCancelling}
+                className="px-4 py-2 text-sm font-medium rounded-md border border-red-300 text-red-600 hover:bg-red-50 disabled:opacity-50 transition-all"
+              >
+                {manualCancelling ? 'Cancelling...' : 'Cancel Run'}
+              </button>
             )}
           </div>
 
-          {/* Benchmark Jobs List - always visible */}
-          <div className="mb-4">
-            <div className="flex items-center justify-between mb-2">
-              <h4 className="text-sm font-semibold text-slate-700">Benchmark Jobs</h4>
-              <button
-                onClick={loadAvailableJobs}
-                disabled={loadingJobs}
-                className="text-xs text-orange-600 hover:text-orange-700 disabled:opacity-50"
+          {/* Step Progress Cards */}
+          <div className="space-y-3">
+            {manualSteps.map((step, i) => (
+              <div
+                key={i}
+                className={`p-4 rounded-lg border transition-all ${
+                  step.status === 'pending' ? 'bg-slate-50 border-slate-200' :
+                  step.status === 'running' ? 'bg-blue-50 border-blue-300 shadow-sm' :
+                  step.status === 'success' ? 'bg-green-50 border-green-300' :
+                  'bg-red-50 border-red-300'
+                }`}
               >
-                {loadingJobs ? 'Loading...' : 'Refresh'}
-              </button>
-            </div>
-            {/* Manual job ID input */}
-            <div className="flex gap-2 items-center mb-3">
-              <input
-                type="text"
-                value={manualJobId}
-                onChange={(e) => setManualJobId(e.target.value)}
-                placeholder="Enter Job ID manually"
-                className="border border-slate-300 rounded-md px-3 py-1.5 text-sm w-48 focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent"
-                onKeyDown={(e) => e.key === 'Enter' && handleLoadJobId()}
-              />
-              <ActionButton label="Load" onClick={handleLoadJobId} variant="secondary" />
-            </div>
-            {availableJobs.length > 0 ? (
-              <div className="border border-slate-200 rounded-lg overflow-hidden">
-                <table className="w-full text-xs">
-                  <thead>
-                    <tr className="bg-slate-50 text-left text-slate-500 uppercase tracking-wide">
-                      <th className="px-3 py-2">Job ID</th>
-                      <th className="px-3 py-2">Name</th>
-                      <th className="px-3 py-2">Latest Run</th>
-                      <th className="px-3 py-2">Last Run Time</th>
-                      <th className="px-3 py-2">Duration</th>
-                      <th className="px-3 py-2"></th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {availableJobs.map((j) => (
-                      <tr
-                        key={j.job_id}
-                        className={`border-t border-slate-100 hover:bg-slate-50 cursor-pointer ${j.job_id === jobId ? 'bg-orange-50 border-l-2 border-l-orange-400' : ''}`}
-                        onClick={() => setJobId(j.job_id)}
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-3">
+                    <span className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold ${
+                      step.status === 'pending' ? 'bg-slate-200 text-slate-500' :
+                      step.status === 'running' ? 'bg-blue-500 text-white animate-pulse' :
+                      step.status === 'success' ? 'bg-green-500 text-white' :
+                      'bg-red-500 text-white'
+                    }`}>
+                      {step.status === 'success' ? '\u2713' : step.status === 'error' ? '!' : i + 1}
+                    </span>
+                    <span className="text-sm font-semibold text-slate-700">Step {i + 1}: {step.name}</span>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    {step.duration_ms !== null && (
+                      <span className="text-xs font-mono text-slate-500">{formatDuration(step.duration_ms)}</span>
+                    )}
+                    {manualCosts[i] && (
+                      <span className="text-xs font-mono text-orange-600">{formatCost(manualCosts[i]!.total_cost_usd)}</span>
+                    )}
+                    {step.link && (
+                      <a
+                        href={step.link}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-xs text-orange-600 hover:text-orange-700 underline"
                       >
-                        <td className="px-3 py-2 font-mono text-orange-600">{j.job_id}</td>
-                        <td className="px-3 py-2 text-slate-700 font-medium">{j.name}</td>
-                        <td className="px-3 py-2">
-                          {j.latest_run ? (
-                            <span className={`inline-block px-2 py-0.5 rounded text-[10px] font-medium ${stateColor(j.latest_run.state, j.latest_run.result_state)}`}>
-                              {stateLabel(j.latest_run.state, j.latest_run.result_state)}
-                            </span>
-                          ) : (
-                            <span className="text-slate-400">No runs</span>
-                          )}
-                        </td>
-                        <td className="px-3 py-2 text-slate-500">
-                          {j.latest_run ? formatTimestamp(j.latest_run.start_time) : '--'}
-                        </td>
-                        <td className="px-3 py-2 font-mono">
-                          {j.latest_run ? formatDuration(j.latest_run.execution_duration) : '--'}
-                        </td>
-                        <td className="px-3 py-2">
-                          <button
-                            onClick={(e) => { e.stopPropagation(); setJobId(j.job_id) }}
-                            className={`text-xs px-2 py-1 rounded ${j.job_id === jobId ? 'bg-orange-100 text-orange-700' : 'bg-slate-100 text-slate-600 hover:bg-orange-50 hover:text-orange-600'}`}
-                          >
-                            {j.job_id === jobId ? 'Selected' : 'Select'}
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+                        View Run
+                      </a>
+                    )}
+                    <span className={`text-[10px] font-medium uppercase px-2 py-0.5 rounded ${
+                      step.status === 'pending' ? 'bg-slate-200 text-slate-500' :
+                      step.status === 'running' ? 'bg-blue-100 text-blue-700' :
+                      step.status === 'success' ? 'bg-green-100 text-green-700' :
+                      'bg-red-100 text-red-700'
+                    }`}>
+                      {step.status}
+                    </span>
+                  </div>
+                </div>
+                {step.output && (
+                  <p className="mt-2 text-xs text-slate-600 ml-10 break-words">{step.output}</p>
+                )}
               </div>
-            ) : !loadingJobs ? (
-              <p className="text-sm text-slate-400">No benchmark jobs found. Create one above.</p>
-            ) : null}
+            ))}
           </div>
 
-          {/* Current Run Status */}
-          {jobStatus && runId && (
-            <div className="mb-4 p-4 bg-slate-50 rounded-lg border border-slate-200">
-              <h4 className="text-sm font-semibold text-slate-700 mb-3">Current Run</h4>
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                <div>
-                  <p className="text-xs text-slate-500 uppercase">State</p>
-                  <span className={`inline-block px-2 py-0.5 rounded text-xs font-medium ${stateColor(jobStatus.state, jobStatus.result_state)}`}>
-                    {stateLabel(jobStatus.state, jobStatus.result_state)}
-                  </span>
-                </div>
-                <div>
-                  <p className="text-xs text-slate-500 uppercase">Run ID</p>
-                  <p className="text-sm font-mono">{jobStatus.run_id}</p>
-                </div>
-                <div>
-                  <p className="text-xs text-slate-500 uppercase">Setup Duration</p>
-                  <p className="text-sm font-mono">{formatDuration(jobStatus.setup_duration)}</p>
-                </div>
-                <div>
-                  <p className="text-xs text-slate-500 uppercase">Execution Duration</p>
-                  <p className="text-sm font-mono">{formatDuration(jobStatus.execution_duration)}</p>
-                </div>
-              </div>
-              {jobStatus.state_message && (
-                <div className="mt-3">
-                  <p className="text-xs text-slate-500 uppercase">Message</p>
-                  <p className="text-sm text-slate-600 mt-1 break-words">{jobStatus.state_message}</p>
-                </div>
-              )}
-              {jobStatus.run_page_url && (
-                <a
-                  href={jobStatus.run_page_url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="inline-block mt-2 text-sm text-orange-600 hover:text-orange-700 underline"
-                >
-                  View Run in Databricks
-                </a>
-              )}
-              {!isTerminal && (
-                <p className="mt-2 text-xs text-slate-400">Auto-refreshing every 10 seconds...</p>
-              )}
-            </div>
-          )}
-
-          {/* Run History */}
-          {jobId && (
-            <div>
-              <div className="flex items-center justify-between mb-2">
-                <h4 className="text-sm font-semibold text-slate-700">Run History</h4>
-                <button
-                  onClick={() => loadJobRuns(jobId)}
-                  disabled={loadingRuns}
-                  className="text-xs text-orange-600 hover:text-orange-700 disabled:opacity-50"
-                >
-                  {loadingRuns ? 'Refreshing...' : 'Refresh'}
-                </button>
-              </div>
-              {jobRuns.length === 0 && !loadingRuns && (
-                <p className="text-sm text-slate-400">No runs yet. Click "Run Benchmark" to start one.</p>
-              )}
-              {jobRuns.length > 0 && (
-                <div className="border border-slate-200 rounded-lg overflow-hidden">
-                  <table className="w-full text-xs">
-                    <thead>
-                      <tr className="bg-slate-50 text-left text-slate-500 uppercase tracking-wide">
-                        <th className="px-3 py-2">Status</th>
-                        <th className="px-3 py-2">Run ID</th>
-                        <th className="px-3 py-2">Started</th>
-                        <th className="px-3 py-2">Setup</th>
-                        <th className="px-3 py-2">Execution</th>
-                        <th className="px-3 py-2">Message</th>
-                        <th className="px-3 py-2"></th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {jobRuns.map((r) => (
-                        <tr
-                          key={r.run_id}
-                          className={`border-t border-slate-100 hover:bg-slate-50 ${r.run_id === runId ? 'bg-orange-50' : ''}`}
-                        >
-                          <td className="px-3 py-2">
-                            <span className={`inline-block px-2 py-0.5 rounded text-[10px] font-medium ${stateColor(r.state, r.result_state)}`}>
-                              {stateLabel(r.state, r.result_state)}
-                            </span>
-                          </td>
-                          <td className="px-3 py-2 font-mono">{r.run_id}</td>
-                          <td className="px-3 py-2 text-slate-500">{formatTimestamp(r.start_time)}</td>
-                          <td className="px-3 py-2 font-mono">{formatDuration(r.setup_duration)}</td>
-                          <td className="px-3 py-2 font-mono">{formatDuration(r.execution_duration)}</td>
-                          <td className="px-3 py-2 text-slate-500 max-w-xs truncate" title={r.state_message}>
-                            {r.state_message ? r.state_message.slice(0, 80) + (r.state_message.length > 80 ? '...' : '') : '--'}
-                          </td>
-                          <td className="px-3 py-2">
-                            {r.run_page_url && (
-                              <a
-                                href={r.run_page_url}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="text-orange-600 hover:text-orange-700 underline"
-                              >
-                                View
-                              </a>
-                            )}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
+          {/* Cost Breakdown - per step */}
+          {manualCosts.some(c => c !== null) && (
+            <div className="mt-6 space-y-4">
+              {(() => {
+                const totalCost = manualCosts.reduce((sum, c) => sum + (c?.total_cost_usd || 0), 0)
+                const totalDuration = manualCosts.reduce((sum, c) => sum + (c?.duration_ms || 0), 0)
+                return (
+                  <div className="p-4 bg-gradient-to-r from-orange-50 to-amber-50 rounded-lg border border-orange-200">
+                    <div className="flex items-center justify-between">
+                      <h4 className="text-sm font-bold text-orange-800">Pipeline Total</h4>
+                      <div className="flex items-center gap-6">
+                        <div className="text-right">
+                          <p className="text-[10px] text-orange-600 uppercase">Total Cost</p>
+                          <p className="text-xl font-bold text-orange-700">{formatCost(totalCost)}</p>
+                        </div>
+                        <div className="text-right">
+                          <p className="text-[10px] text-orange-600 uppercase">Total Duration</p>
+                          <p className="text-xl font-bold text-orange-700">{formatDuration(totalDuration)}</p>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )
+              })()}
+              {manualCosts.map((cost, ci) => {
+                if (!cost) return null
+                const labels = ['Batch Load', 'Incremental Batch 2', 'Incremental Batch 3']
+                return (
+                  <div key={ci} className="p-4 bg-gradient-to-r from-slate-50 to-blue-50 rounded-lg border border-slate-200">
+                    <h4 className="text-sm font-bold text-slate-700 mb-3">{labels[ci]} (SF {scaleFactor})</h4>
+                    <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+                      <div className="bg-white rounded-lg p-2.5 border border-slate-100">
+                        <p className="text-[10px] text-slate-500 uppercase">VM Compute</p>
+                        <p className="text-base font-bold text-slate-800">{formatCost(cost.vm_cost_usd)}</p>
+                      </div>
+                      <div className="bg-white rounded-lg p-2.5 border border-slate-100">
+                        <p className="text-[10px] text-slate-500 uppercase">DBU Cost</p>
+                        <p className="text-base font-bold text-slate-800">{formatCost(cost.dbu_cost_usd)}</p>
+                        <p className="text-[9px] text-slate-400">{cost.total_dbus} DBUs @ {formatCost(cost.dbu_list_price)}/DBU</p>
+                      </div>
+                      <div className="bg-white rounded-lg p-2.5 border border-slate-100">
+                        <p className="text-[10px] text-slate-500 uppercase">Local SSD</p>
+                        <p className="text-base font-bold text-slate-800">{formatCost(cost.ssd_cost_usd)}</p>
+                        <p className="text-[9px] text-slate-400">{cost.cluster.local_ssd_count} SSD(s)</p>
+                      </div>
+                      <div className="bg-white rounded-lg p-2.5 border border-orange-200 bg-orange-50">
+                        <p className="text-[10px] text-orange-600 uppercase font-semibold">Total</p>
+                        <p className="text-base font-bold text-orange-700">{formatCost(cost.total_cost_usd)}</p>
+                      </div>
+                      <div className="bg-white rounded-lg p-2.5 border border-slate-100">
+                        <p className="text-[10px] text-slate-500 uppercase">Duration</p>
+                        <p className="text-sm font-mono text-slate-700">{formatDuration(cost.duration_ms)}</p>
+                        <p className="text-[9px] text-slate-400">{cost.cluster.worker_node_type} x{cost.cluster.num_workers}</p>
+                      </div>
+                    </div>
+                    {cost.run_page_url && (
+                      <a href={cost.run_page_url} target="_blank" rel="noopener noreferrer" className="inline-block mt-2 text-xs text-orange-600 hover:text-orange-700 underline">View Run</a>
+                    )}
+                  </div>
+                )
+              })}
             </div>
           )}
         </div>

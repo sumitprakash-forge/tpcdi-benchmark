@@ -2,8 +2,6 @@
 import json
 import os
 import traceback
-import base64
-from pathlib import Path
 from typing import Optional, List
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
@@ -12,8 +10,8 @@ from server.config import get_workspace_client, get_user_email
 
 router = APIRouter()
 
-# Path to bundled notebooks (shipped with the app)
-NOTEBOOKS_DIR = Path(__file__).parent / "notebooks"
+# Notebooks live in the repo (not bundled with the app).
+# Bootstrap verifies they exist at the workspace repo path.
 
 # ── GCP Pricing Data ──────────────────────────────────────────────────────
 
@@ -702,8 +700,11 @@ class BootstrapRequest(BaseModel):
 
 @router.post("/databricks/bootstrap")
 async def bootstrap_workspace(req: BootstrapRequest, request: Request):
-    """Deploy bundled notebooks to workspace and download spark-xml JAR to Volume.
-    Makes the app fully self-contained — no manual setup required.
+    """Verify notebooks exist in workspace repo and download spark-xml JAR to Volume.
+
+    Notebooks and the benchmark module live in the Git repo (not bundled with the app).
+    They are synced to the workspace via Git Repos or databricks sync.
+    This endpoint verifies they are present and sets up the JAR dependency.
     """
     try:
         w = get_workspace_client(request)
@@ -718,80 +719,38 @@ async def bootstrap_workspace(req: BootstrapRequest, request: Request):
             sp_identity = "shared"
         ws_base = f"/Workspace/Users/{sp_identity}/tpcdi-benchmark/databricks"
 
-        # 2. Deploy bundled notebooks
-        notebooks = {
-            "benchmark_databricks_notebook": "benchmark_databricks_notebook.txt",
-            "generate_tpcdi_data_notebook": "generate_tpcdi_data_notebook.txt",
-        }
+        # 2. Verify notebooks exist in workspace (deployed via Git/sync, not by this app)
+        notebooks = [
+            "benchmark_databricks_notebook",
+            "generate_tpcdi_data_notebook",
+        ]
 
-        for nb_name, nb_file in notebooks.items():
+        for nb_name in notebooks:
             nb_path = f"{ws_base}/{nb_name}"
-            local_file = NOTEBOOKS_DIR / nb_file
-            if not local_file.exists():
-                steps.append({"step": f"notebook_{nb_name}", "name": nb_path, "status": "error", "error": "Bundled notebook not found"})
-                continue
-
             try:
-                # Check if already exists
                 w.workspace.get_status(nb_path)
                 steps.append({"step": f"notebook_{nb_name}", "name": nb_path, "status": "exists"})
             except Exception:
-                try:
-                    # Create parent dirs
-                    parent_dir = "/".join(nb_path.rsplit("/", 1)[:-1])
-                    w.workspace.mkdirs(parent_dir)
+                steps.append({
+                    "step": f"notebook_{nb_name}",
+                    "name": nb_path,
+                    "status": "error",
+                    "error": f"Notebook not found at {nb_path}. Sync the repo to workspace first.",
+                })
 
-                    content = local_file.read_text()
-                    content_b64 = base64.b64encode(content.encode()).decode()
-                    from databricks.sdk.service.workspace import ImportFormat, Language
-                    w.workspace.import_(
-                        path=nb_path,
-                        content=content_b64,
-                        format=ImportFormat.SOURCE,
-                        language=Language.PYTHON,
-                        overwrite=True,
-                    )
-                    steps.append({"step": f"notebook_{nb_name}", "name": nb_path, "status": "created"})
-                except Exception as e:
-                    steps.append({"step": f"notebook_{nb_name}", "name": nb_path, "status": "error", "error": str(e)})
-
-        # 2b. Deploy benchmark Python module (ETL framework used by notebooks)
-        # IMPORTANT: Must upload as regular FILES (not notebooks) so Python can import them.
-        # Notebooks strip .py extension; Python's import system needs actual .py files.
-        benchmark_dir = NOTEBOOKS_DIR / "benchmark"
-        if benchmark_dir.exists():
-            benchmark_ws_base = ws_base.rsplit("/databricks", 1)[0]  # /Workspace/Users/.../tpcdi-benchmark
-            benchmark_ws_path = f"{benchmark_ws_base}/benchmark"
-            try:
-                # Check if already deployed by looking for __init__.py as a FILE
-                w.workspace.get_status(f"{benchmark_ws_path}/__init__.py")
-                steps.append({"step": "benchmark_module", "name": benchmark_ws_path, "status": "exists"})
-            except Exception:
-                try:
-                    deployed = 0
-                    for py_file in sorted(benchmark_dir.rglob("*.py")):
-                        rel_path = py_file.relative_to(benchmark_dir)
-                        # Keep .py extension — upload as workspace FILE, not notebook
-                        ws_file_path = f"{benchmark_ws_path}/{rel_path}"
-                        # Create parent dirs
-                        parent = "/".join(ws_file_path.rsplit("/", 1)[:-1])
-                        try:
-                            w.workspace.mkdirs(parent)
-                        except Exception:
-                            pass
-                        content_bytes = py_file.read_bytes()
-                        content_b64 = base64.b64encode(content_bytes).decode()
-                        from databricks.sdk.service.workspace import ImportFormat
-                        w.workspace.import_(
-                            path=ws_file_path,
-                            content=content_b64,
-                            format=ImportFormat.AUTO,
-                            overwrite=True,
-                        )
-                        deployed += 1
-                    steps.append({"step": "benchmark_module", "name": f"{benchmark_ws_path} ({deployed} files)", "status": "created"})
-                except Exception as e:
-                    steps.append({"step": "benchmark_module", "name": benchmark_ws_path, "status": "error", "error": str(e)})
+        # 2b. Verify benchmark Python module exists in workspace
+        benchmark_ws_base = ws_base.rsplit("/databricks", 1)[0]
+        benchmark_ws_path = f"{benchmark_ws_base}/benchmark"
+        try:
+            w.workspace.get_status(f"{benchmark_ws_path}/__init__.py")
+            steps.append({"step": "benchmark_module", "name": benchmark_ws_path, "status": "exists"})
+        except Exception:
+            steps.append({
+                "step": "benchmark_module",
+                "name": benchmark_ws_path,
+                "status": "error",
+                "error": f"Benchmark module not found at {benchmark_ws_path}. Sync the repo to workspace first.",
+            })
 
         # 3. Download spark-xml JAR to Volume
         jar_name = "spark-xml_2.13-0.18.0.jar"
@@ -799,7 +758,6 @@ async def bootstrap_workspace(req: BootstrapRequest, request: Request):
         maven_url = "https://repo1.maven.org/maven2/com/databricks/spark-xml_2.13/0.18.0/spark-xml_2.13-0.18.0.jar"
 
         try:
-            # Check if JAR already exists in volume via files API
             w.api_client.do("GET", "/api/2.0/fs/files", query={"path": vol_path.lstrip("/")})
             steps.append({"step": "spark_xml_jar", "name": vol_path, "status": "exists"})
         except Exception:
@@ -807,12 +765,10 @@ async def bootstrap_workspace(req: BootstrapRequest, request: Request):
                 import urllib.request
                 import tempfile
 
-                # Download JAR from Maven
                 with tempfile.NamedTemporaryFile(suffix=".jar", delete=False) as tmp:
                     urllib.request.urlretrieve(maven_url, tmp.name)
                     tmp_path = tmp.name
 
-                # Upload to volume via files API
                 with open(tmp_path, "rb") as f:
                     jar_bytes = f.read()
 
@@ -823,8 +779,6 @@ async def bootstrap_workspace(req: BootstrapRequest, request: Request):
                     headers={"Content-Type": "application/octet-stream"},
                 )
                 steps.append({"step": "spark_xml_jar", "name": vol_path, "status": "created"})
-
-                # Cleanup temp file
                 os.unlink(tmp_path)
             except Exception as e:
                 steps.append({"step": "spark_xml_jar", "name": vol_path, "status": "error", "error": str(e)})
