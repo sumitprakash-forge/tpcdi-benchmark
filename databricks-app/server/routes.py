@@ -968,8 +968,12 @@ async def create_job(req: JobCreateRequest, request: Request):
 async def run_job(req: RunJobRequest, request: Request):
     try:
         w = get_workspace_client(request)
-        run = w.jobs.run_now(job_id=req.job_id)
-        return {"status": "success", "run_id": run.run_id}
+        wait = w.jobs.run_now(job_id=req.job_id)
+        run_id = wait.run_id
+        # Build run_page_url from workspace host
+        host = str(w.config.host).rstrip("/")
+        run_page_url = f"{host}#job/{req.job_id}/run/{run_id}"
+        return {"status": "success", "run_id": run_id, "run_page_url": run_page_url}
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
