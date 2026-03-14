@@ -12,7 +12,7 @@ This guide describes how to run the benchmark on **Dataproc**: prerequisites, al
 4. GCP **project ID** and **region**.
 5. **Metastore (optional):** Without a [Dataproc Metastore](https://cloud.google.com/dataproc-metastore/docs), Spark uses the default metastore. The benchmark sets the warehouse to GCS (`gs://<bucket>/spark-warehouse`) and uses two-part table names (`database.table`) and Parquet by default. See **../docs/DATAPROC_METASTORE.md**.
 
-**How this guide is structured:** §0 documents optional infrastructure (VPC, subnet, firewall, cluster). §1 lists all parameters (gcloud + script). §2 explains which are mandatory vs optional. §3 describes what each parameter means. §4–§5 cover setup and run commands; **§5 includes steps to submit a job to Dataproc Serverless** (no cluster). §6 explains running with a service account. §7 gives a full example with SA. The end section covers Dataproc-specific troubleshooting.
+**How this guide is structured:** §0 documents optional infrastructure (VPC, subnet, firewall, cluster). §1 lists all parameters (gcloud + script). §2 explains which are mandatory vs optional. §3 describes what each parameter means. §4 covers setup. §5 covers the full sequential pipeline (Batch Load → Incremental Batch 2 → Incremental Batch 3), including Dataproc Serverless. §6 explains running with a service account. §7 gives a full sequential example with SA. The end section covers Dataproc-specific troubleshooting.
 
 ---
 
@@ -286,57 +286,248 @@ Pass `--py-files=benchmark.zip` (or `--py-files=gs://<bucket>/benchmark.zip` if 
 
 ---
 
-## 5. Run commands
+## 5. Run commands — Full Sequential Pipeline
 
-### Batch load
+The TPC-DI benchmark runs as a **3-step sequential pipeline**. Each step must complete before the next starts. This matches the Databricks workflow pattern: Batch Load first builds the warehouse, then Incremental loads apply changes.
 
-```bash
-gcloud dataproc jobs submit pyspark run_benchmark_dataproc.py \
-  --cluster=<cluster-name> \
-  --region=us-central1 \
-  --project=<your-project> \
-  --py-files=benchmark.zip \
-  -- \
-  --load-type batch \
-  --scale-factor 10 \
-  --gcs-bucket=<your-bucket> \
-  --project-id=<your-project> \
-  --region=us-central1
+```
+Step 1: Batch Load (SF 100)          → Creates warehouse tables (historical + Batch1)
+         ↓ (must complete first)
+Step 2: Incremental Load - Batch 2   → Applies incremental changes (Batch2)
+         ↓ (must complete first)
+Step 3: Incremental Load - Batch 3   → Applies incremental changes (Batch3)
 ```
 
-### With per-table timing (`--log-detailed-stats`)
+**Each step runs the same cycle:** create cluster → submit job → wait for completion → delete cluster.
+
+### 5.0 Setup (one time)
 
 ```bash
+# From project root
+export PROJECT=<your-project>
+export REGION=us-central1
+export ZONE=us-central1-a
+export GCS_BUCKET=<your-bucket>
+export RAW_DATA_PATH=gs://${GCS_BUCKET}/tpcdi
+export TARGET_DATABASE=tpcdi_warehouse
+export METRICS_OUTPUT=gs://${GCS_BUCKET}/tpcdi/metrics
+export SF=100
+
+# Package the benchmark module
+zip -r benchmark.zip benchmark
+```
+
+### 5.1 Step 1: Batch Load (SF 100)
+
+This creates the full data warehouse — all dimension and fact tables from historical data plus Batch1.
+
+**Create the cluster:**
+```bash
+gcloud dataproc clusters create tpcdi-dp-sf${SF}-batch \
+  --project=${PROJECT} --region=${REGION} --zone=${ZONE} \
+  --image-version=2.3-debian12 \
+  --master-machine-type=n2d-standard-8 --master-boot-disk-size=100 --num-master-local-ssds=4 \
+  --num-workers=3 --worker-machine-type=n2d-standard-8 --worker-boot-disk-size=200 --num-worker-local-ssds=2 \
+  --subnet=<your-subnet> --no-address \
+  --optional-components=DELTA --enable-component-gateway --scopes=cloud-platform
+```
+
+**Submit the batch load job:**
+```bash
 gcloud dataproc jobs submit pyspark run_benchmark_dataproc.py \
-  --cluster=<cluster-name> \
-  --region=us-central1 \
-  --project=<your-project> \
+  --cluster=tpcdi-dp-sf${SF}-batch \
+  --region=${REGION} \
+  --project=${PROJECT} \
   --py-files=benchmark.zip \
+  --jars=dataproc/libs/spark-xml_2.12-0.18.0.jar \
   -- \
   --load-type batch \
-  --scale-factor 10 \
-  --gcs-bucket=<your-bucket> \
-  --project-id=<your-project> \
-  --region=us-central1 \
+  --scale-factor ${SF} \
+  --format delta \
+  --gcs-bucket=${GCS_BUCKET} \
+  --project-id=${PROJECT} \
+  --region=${REGION} \
+  --raw-data-path=${RAW_DATA_PATH} \
+  --target-database=${TARGET_DATABASE} \
+  --target-schema=dw \
+  --save-metrics \
+  --metrics-output=${METRICS_OUTPUT} \
   --log-detailed-stats
 ```
 
-### Incremental load
+**Monitor the job:**
+```bash
+# Get job ID from the submit output, then:
+gcloud dataproc jobs describe <JOB_ID> --region=${REGION} --project=${PROJECT}
 
+# Or wait for completion:
+gcloud dataproc jobs wait <JOB_ID> --region=${REGION} --project=${PROJECT}
+```
+
+**Delete the cluster after completion:**
+```bash
+gcloud dataproc clusters delete tpcdi-dp-sf${SF}-batch \
+  --region=${REGION} --project=${PROJECT} --quiet
+```
+
+### 5.2 Step 2: Incremental Load - Batch 2 (SF 100)
+
+**Only start after Step 1 completes successfully.** This applies the second batch of incremental changes to the warehouse created in Step 1.
+
+**Create the cluster:**
+```bash
+gcloud dataproc clusters create tpcdi-dp-sf${SF}-inc-b2 \
+  --project=${PROJECT} --region=${REGION} --zone=${ZONE} \
+  --image-version=2.3-debian12 \
+  --master-machine-type=n2d-standard-8 --master-boot-disk-size=100 --num-master-local-ssds=4 \
+  --num-workers=3 --worker-machine-type=n2d-standard-8 --worker-boot-disk-size=200 --num-worker-local-ssds=2 \
+  --subnet=<your-subnet> --no-address \
+  --optional-components=DELTA --enable-component-gateway --scopes=cloud-platform
+```
+
+**Submit the incremental load (batch-id 2):**
 ```bash
 gcloud dataproc jobs submit pyspark run_benchmark_dataproc.py \
-  --cluster=<cluster-name> \
-  --region=us-central1 \
-  --project=<your-project> \
+  --cluster=tpcdi-dp-sf${SF}-inc-b2 \
+  --region=${REGION} \
+  --project=${PROJECT} \
   --py-files=benchmark.zip \
+  --jars=dataproc/libs/spark-xml_2.12-0.18.0.jar \
   -- \
   --load-type incremental \
-  --scale-factor 10 \
+  --scale-factor ${SF} \
   --batch-id 2 \
-  --gcs-bucket=<your-bucket> \
-  --project-id=<your-project> \
-  --region=us-central1
+  --format delta \
+  --gcs-bucket=${GCS_BUCKET} \
+  --project-id=${PROJECT} \
+  --region=${REGION} \
+  --raw-data-path=${RAW_DATA_PATH} \
+  --target-database=${TARGET_DATABASE} \
+  --target-schema=dw \
+  --save-metrics \
+  --metrics-output=${METRICS_OUTPUT} \
+  --log-detailed-stats
 ```
+
+**Wait for completion, then delete:**
+```bash
+gcloud dataproc jobs wait <JOB_ID> --region=${REGION} --project=${PROJECT}
+gcloud dataproc clusters delete tpcdi-dp-sf${SF}-inc-b2 \
+  --region=${REGION} --project=${PROJECT} --quiet
+```
+
+### 5.3 Step 3: Incremental Load - Batch 3 (SF 100)
+
+**Only start after Step 2 completes successfully.** This applies the third and final batch of incremental changes.
+
+**Create the cluster:**
+```bash
+gcloud dataproc clusters create tpcdi-dp-sf${SF}-inc-b3 \
+  --project=${PROJECT} --region=${REGION} --zone=${ZONE} \
+  --image-version=2.3-debian12 \
+  --master-machine-type=n2d-standard-8 --master-boot-disk-size=100 --num-master-local-ssds=4 \
+  --num-workers=3 --worker-machine-type=n2d-standard-8 --worker-boot-disk-size=200 --num-worker-local-ssds=2 \
+  --subnet=<your-subnet> --no-address \
+  --optional-components=DELTA --enable-component-gateway --scopes=cloud-platform
+```
+
+**Submit the incremental load (batch-id 3):**
+```bash
+gcloud dataproc jobs submit pyspark run_benchmark_dataproc.py \
+  --cluster=tpcdi-dp-sf${SF}-inc-b3 \
+  --region=${REGION} \
+  --project=${PROJECT} \
+  --py-files=benchmark.zip \
+  --jars=dataproc/libs/spark-xml_2.12-0.18.0.jar \
+  -- \
+  --load-type incremental \
+  --scale-factor ${SF} \
+  --batch-id 3 \
+  --format delta \
+  --gcs-bucket=${GCS_BUCKET} \
+  --project-id=${PROJECT} \
+  --region=${REGION} \
+  --raw-data-path=${RAW_DATA_PATH} \
+  --target-database=${TARGET_DATABASE} \
+  --target-schema=dw \
+  --save-metrics \
+  --metrics-output=${METRICS_OUTPUT} \
+  --log-detailed-stats
+```
+
+**Wait for completion, then delete:**
+```bash
+gcloud dataproc jobs wait <JOB_ID> --region=${REGION} --project=${PROJECT}
+gcloud dataproc clusters delete tpcdi-dp-sf${SF}-inc-b3 \
+  --region=${REGION} --project=${PROJECT} --quiet
+```
+
+### 5.4 Job Run Details and Cost
+
+After each job completes, capture run details for benchmarking:
+
+**Get job run details:**
+```bash
+gcloud dataproc jobs describe <JOB_ID> --region=${REGION} --project=${PROJECT} --format=json
+```
+
+Key fields in the output:
+| Field | Description |
+|-------|-------------|
+| `status.state` | `DONE`, `ERROR`, or `CANCELLED` |
+| `statusHistory` | Timestamps for each state transition |
+| `driverControlFilesUri` | GCS path to driver output files |
+| `yarnApplications[0].trackingUrl` | Spark UI URL (if component gateway enabled) |
+
+**Cost estimation** (GCP VM + Dataproc premium):
+
+| Component | Formula |
+|-----------|---------|
+| VM cost | `(master_rate + num_workers * worker_rate) * hours` |
+| Dataproc premium | `total_vCPUs * $0.01/vCPU/hr * hours` |
+| Local SSD cost | `ssd_count * (1 + num_workers) * $0.0416/SSD/hr * hours` |
+| **Total** | `VM + Dataproc premium + SSD` |
+
+Example for SF 100 batch (n2d-standard-8 master, 3x n2d-standard-8 workers, 2 SSDs each, 45 min):
+```
+VM:      (0.3508 + 3 * 0.3508) * 0.75 hr = $1.0524
+Premium: (8 + 3*8) * 0.01 * 0.75 hr      = $0.24
+SSD:     2 * 4 * 0.0416 * 0.75 hr         = $0.2496
+Total:                                      = $1.5420
+```
+
+**Metrics JSON** is saved to `${METRICS_OUTPUT}/` after each run. View with:
+```bash
+gsutil ls ${METRICS_OUTPUT}/
+gsutil cat ${METRICS_OUTPUT}/metrics_batch_*.json | python3 -m json.tool
+```
+
+### 5.5 Automated Sequential Run (Script)
+
+To run all three steps in sequence automatically (fail-fast — stops on first error), use the orchestration script:
+
+```bash
+# From project root
+./dataproc/run_tpcdi_cycle_dataproc_classic.sh
+```
+
+This script creates a cluster, runs the job, deletes the cluster for each step in order:
+1. Batch Load (SF configured in the script)
+2. Incremental Load - Batch 2
+3. Incremental Load - Batch 3
+
+See the script for cluster sizing per scale factor.
+
+### 5.6 Using the Databricks App UI
+
+The Databricks App (`databricks-app/`) provides a web UI with a **Dataproc** tab that:
+1. Authenticates with Google Cloud
+2. Auto-creates prerequisites (VPC, subnet, firewall, Cloud NAT)
+3. Runs the 3-step pipeline sequentially with live status
+4. Shows per-step timing, cost breakdown, and GCP Console links
+5. Persists state across page refreshes
+
+See `databricks-app/DEPLOY.md` for deployment instructions.
 
 ---
 
@@ -576,63 +767,151 @@ For more detail, see **../docs/DATAPROC_SERVICE_ACCOUNT.md**.
 
 ---
 
-## 7. Full example: Dataproc run with service account
+## 7. Full example: Sequential pipeline with service account
 
-Complete `gcloud` command with SA, optional parameters set explicitly:
+Complete 3-step sequential pipeline with SA, all optional parameters set explicitly. Each step: create cluster → run job → delete cluster.
 
 ```bash
-zip -r benchmark.zip benchmark
+# Setup
+export PROJECT=gcp-sandbox-field-eng
+export REGION=us-central1
+export ZONE=us-central1-a
+export GCS_BUCKET=sumit_prakash_gcs
+export RAW_DATA_PATH=gs://sumit_prakash_gcs/tpcdi
+export SA_EMAIL=sumit-wmt-workspace-creator@gcp-sandbox-field-eng.iam.gserviceaccount.com
+export SA_KEY=gs://sumit_prakash_gcs/service_account_key_file/service_account.json
+export SF=10
 
+zip -r benchmark.zip benchmark
+```
+
+### Step 1: Batch Load
+
+```bash
+# Create cluster
+gcloud dataproc clusters create tpcdi-dp-sf${SF}-batch \
+  --project=${PROJECT} --region=${REGION} --zone=${ZONE} \
+  --image-version=2.3-debian12 \
+  --master-machine-type=n2d-standard-8 --master-boot-disk-size=100 --num-master-local-ssds=4 \
+  --num-workers=3 --worker-machine-type=n2d-standard-8 --worker-boot-disk-size=200 --num-worker-local-ssds=2 \
+  --subnet=<your-subnet> --no-address \
+  --optional-components=DELTA --enable-component-gateway --scopes=cloud-platform
+
+# Submit batch load
 gcloud dataproc jobs submit pyspark run_benchmark_dataproc.py \
-  --cluster=sumitbnchmark \
-  --region=us-central1 \
-  --project=gcp-sandbox-field-eng \
+  --cluster=tpcdi-dp-sf${SF}-batch \
+  --region=${REGION} \
+  --project=${PROJECT} \
   --py-files=benchmark.zip \
   --jars=dataproc/libs/spark-xml_2.12-0.18.0.jar \
   -- \
   --load-type batch \
-  --scale-factor 10 \
+  --scale-factor ${SF} \
   --format delta \
-  --gcs-bucket=sumit_prakash_gcs \
-  --project-id=gcp-sandbox-field-eng \
-  --region=us-central1 \
-  --raw-data-path=gs://sumit_prakash_gcs/benchmark/__unitystorage/catalogs/059afd06-0390-412b-9f4b-af8a5511fd35/volumes/f91c4ca5-899e-4ce2-8989-bf7627b9dda2/sf=10 \
+  --gcs-bucket=${GCS_BUCKET} \
+  --project-id=${PROJECT} \
+  --region=${REGION} \
+  --raw-data-path=${RAW_DATA_PATH} \
   --target-database=tpcdi_warehouse \
   --target-schema=dw \
   --spark-master=yarn \
   --save-metrics \
-  --metrics-output=gs://sumit_prakash_gcs/tpcdi/metrics \
-  --service-account-email=tsumit-wmt-workspace-creator@gcp-sandbox-field-eng.iam.gserviceaccount.com \
-  --service-account-key-file=gs://sumit_prakash_gcs/service_account_key_file/service_account.json
+  --metrics-output=gs://${GCS_BUCKET}/tpcdi/metrics \
+  --log-detailed-stats \
+  --service-account-email=${SA_EMAIL} \
+  --service-account-key-file=${SA_KEY}
+
+# Wait and delete cluster
+gcloud dataproc jobs wait <JOB_ID> --region=${REGION} --project=${PROJECT}
+gcloud dataproc clusters delete tpcdi-dp-sf${SF}-batch \
+  --region=${REGION} --project=${PROJECT} --quiet
 ```
 
-**Notes:** `--jars=dataproc/libs/...` uses the bundled spark-xml JAR; run from project root. `--format delta` adds the Delta package. With `--service-account-key-file=gs://...`, Spark uses **default** GCS credentials (key not local). For Spark to use the SA, use a **local** key path on the driver. Add `--log-detailed-stats` for per-table timing.
-
-**Incremental (batch 2):**
+### Step 2: Incremental Load - Batch 2 (after Step 1 completes)
 
 ```bash
+# Create cluster
+gcloud dataproc clusters create tpcdi-dp-sf${SF}-inc-b2 \
+  --project=${PROJECT} --region=${REGION} --zone=${ZONE} \
+  --image-version=2.3-debian12 \
+  --master-machine-type=n2d-standard-8 --master-boot-disk-size=100 --num-master-local-ssds=4 \
+  --num-workers=3 --worker-machine-type=n2d-standard-8 --worker-boot-disk-size=200 --num-worker-local-ssds=2 \
+  --subnet=<your-subnet> --no-address \
+  --optional-components=DELTA --enable-component-gateway --scopes=cloud-platform
+
+# Submit incremental batch 2
 gcloud dataproc jobs submit pyspark run_benchmark_dataproc.py \
-  --cluster=sumitbnchmark \
-  --region=us-central1 \
-  --project=gcp-sandbox-field-eng \
+  --cluster=tpcdi-dp-sf${SF}-inc-b2 \
+  --region=${REGION} \
+  --project=${PROJECT} \
   --py-files=benchmark.zip \
   --jars=dataproc/libs/spark-xml_2.12-0.18.0.jar \
   -- \
   --load-type incremental \
-  --scale-factor 10 \
+  --scale-factor ${SF} \
   --batch-id 2 \
   --format delta \
-  --gcs-bucket=sumit_prakash_gcs \
-  --project-id=gcp-sandbox-field-eng \
-  --region=us-central1 \
-  --raw-data-path=gs://sumit_prakash_gcs/benchmark/__unitystorage/catalogs/059afd06-0390-412b-9f4b-af8a5511fd35/volumes/f91c4ca5-899e-4ce2-8989-bf7627b9dda2/sf=10 \
+  --gcs-bucket=${GCS_BUCKET} \
+  --project-id=${PROJECT} \
+  --region=${REGION} \
+  --raw-data-path=${RAW_DATA_PATH} \
   --target-database=tpcdi_warehouse \
   --target-schema=dw \
   --save-metrics \
-  --metrics-output=gs://sumit_prakash_gcs/tpcdi/metrics \
-  --service-account-email=tsumit-wmt-workspace-creator@gcp-sandbox-field-eng.iam.gserviceaccount.com \
-  --service-account-key-file=gs://sumit_prakash_gcs/service_account_key_file/service_account.json
+  --metrics-output=gs://${GCS_BUCKET}/tpcdi/metrics \
+  --log-detailed-stats \
+  --service-account-email=${SA_EMAIL} \
+  --service-account-key-file=${SA_KEY}
+
+# Wait and delete cluster
+gcloud dataproc jobs wait <JOB_ID> --region=${REGION} --project=${PROJECT}
+gcloud dataproc clusters delete tpcdi-dp-sf${SF}-inc-b2 \
+  --region=${REGION} --project=${PROJECT} --quiet
 ```
+
+### Step 3: Incremental Load - Batch 3 (after Step 2 completes)
+
+```bash
+# Create cluster
+gcloud dataproc clusters create tpcdi-dp-sf${SF}-inc-b3 \
+  --project=${PROJECT} --region=${REGION} --zone=${ZONE} \
+  --image-version=2.3-debian12 \
+  --master-machine-type=n2d-standard-8 --master-boot-disk-size=100 --num-master-local-ssds=4 \
+  --num-workers=3 --worker-machine-type=n2d-standard-8 --worker-boot-disk-size=200 --num-worker-local-ssds=2 \
+  --subnet=<your-subnet> --no-address \
+  --optional-components=DELTA --enable-component-gateway --scopes=cloud-platform
+
+# Submit incremental batch 3
+gcloud dataproc jobs submit pyspark run_benchmark_dataproc.py \
+  --cluster=tpcdi-dp-sf${SF}-inc-b3 \
+  --region=${REGION} \
+  --project=${PROJECT} \
+  --py-files=benchmark.zip \
+  --jars=dataproc/libs/spark-xml_2.12-0.18.0.jar \
+  -- \
+  --load-type incremental \
+  --scale-factor ${SF} \
+  --batch-id 3 \
+  --format delta \
+  --gcs-bucket=${GCS_BUCKET} \
+  --project-id=${PROJECT} \
+  --region=${REGION} \
+  --raw-data-path=${RAW_DATA_PATH} \
+  --target-database=tpcdi_warehouse \
+  --target-schema=dw \
+  --save-metrics \
+  --metrics-output=gs://${GCS_BUCKET}/tpcdi/metrics \
+  --log-detailed-stats \
+  --service-account-email=${SA_EMAIL} \
+  --service-account-key-file=${SA_KEY}
+
+# Wait and delete cluster
+gcloud dataproc jobs wait <JOB_ID> --region=${REGION} --project=${PROJECT}
+gcloud dataproc clusters delete tpcdi-dp-sf${SF}-inc-b3 \
+  --region=${REGION} --project=${PROJECT} --quiet
+```
+
+**Notes:** `--jars=dataproc/libs/...` uses the bundled spark-xml JAR; run from project root. `--format delta` adds the Delta package. With `--service-account-key-file=gs://...`, Spark uses **default** GCS credentials (key not local). For Spark to use the SA, use a **local** key path on the driver.
 
 ---
 
