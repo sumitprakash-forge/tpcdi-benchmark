@@ -483,6 +483,36 @@ export default function DataprocTab() {
             })
           }
           setE2eRunId(null)
+          // Auto-continue: start next spec directly
+          setE2eRemainingSpecs(prev => {
+            if (e2eCancelledRef.current || prev.length === 0) {
+              if (prev.length === 0) {
+                setE2eRunning(false)
+                setE2eActiveStep(null)
+                fetch('/api/databricks/save-run', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    run_data: {
+                      platform: 'dataproc',
+                      mode: 'e2e',
+                      scale_factor: e2eSF,
+                      steps: e2eSteps,
+                      costs: runCosts,
+                      completed_at: new Date().toISOString(),
+                    }
+                  })
+                }).catch(() => {})
+              }
+              if (e2eCancelledRef.current) {
+                setE2eRunning(false)
+              }
+              return prev.length === 0 ? prev : []
+            }
+            const [next, ...rest] = prev
+            setTimeout(() => startE2ERunSpec(next), 0)
+            return rest
+          })
           return true
         }
 
@@ -509,43 +539,6 @@ export default function DataprocTab() {
     }, 10000)
     return () => clearInterval(interval)
   }, [e2eRunId, e2eActiveStep])
-
-  // Auto-continue: when a run completes, start next spec
-  useEffect(() => {
-    if (e2eRunId !== null || !e2eRunning) return
-    if (e2eCancelledRef.current) {
-      setE2eRunning(false)
-      setE2eRemainingSpecs([])
-      return
-    }
-    // All specs done — pipeline complete
-    if (e2eRemainingSpecs.length === 0) {
-      setE2eRunning(false)
-      setE2eActiveStep(null)
-      ;(async () => {
-        try {
-          await fetch('/api/databricks/save-run', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              run_data: {
-                platform: 'dataproc',
-                mode: 'e2e',
-                scale_factor: e2eSF,
-                steps: e2eSteps,
-                costs: runCosts,
-                completed_at: new Date().toISOString(),
-              }
-            })
-          })
-        } catch {}
-      })()
-      return
-    }
-    const [next, ...rest] = e2eRemainingSpecs
-    setE2eRemainingSpecs(rest)
-    startE2ERunSpec(next)
-  }, [e2eRunId, e2eRunning, e2eRemainingSpecs])
 
   // Main E2E handler
   async function handleRunE2E() {

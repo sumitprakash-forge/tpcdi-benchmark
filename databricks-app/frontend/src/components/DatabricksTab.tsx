@@ -672,6 +672,39 @@ export default function DatabricksTab() {
             setE2eRunning(false)
             setE2eActiveStep(null)
             setE2eRemainingSpecs([])
+          } else {
+            // Auto-continue: start next spec directly from polling callback
+            setE2eRemainingSpecs(prev => {
+              if (e2eCancelledRef.current || prev.length === 0) {
+                // Pipeline complete or cancelled
+                if (prev.length === 0) {
+                  setE2eRunning(false)
+                  setE2eActiveStep(null)
+                  fetch('/api/databricks/save-run', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      run_data: {
+                        platform: 'databricks',
+                        mode: 'e2e',
+                        scale_factor: e2eSF,
+                        steps: e2eSteps,
+                        costs: runCosts,
+                        completed_at: new Date().toISOString(),
+                      }
+                    })
+                  }).catch(() => {})
+                }
+                if (e2eCancelledRef.current) {
+                  setE2eRunning(false)
+                }
+                return prev.length === 0 ? prev : []
+              }
+              const [next, ...rest] = prev
+              // Kick off next spec asynchronously
+              setTimeout(() => startE2ERunSpec(next), 0)
+              return rest
+            })
           }
           return true
         }
@@ -689,46 +722,6 @@ export default function DatabricksTab() {
     }, 10000)
     return () => clearInterval(interval)
   }, [e2eRunId, e2eActiveStep])
-
-  // Auto-continue: when a run completes (e2eRunId becomes null) and there are remaining specs
-  useEffect(() => {
-    if (e2eRunId !== null || !e2eRunning) return
-    if (e2eCancelledRef.current) {
-      setE2eRunning(false)
-      setE2eRemainingSpecs([])
-      return
-    }
-    // All specs done — pipeline complete
-    if (e2eRemainingSpecs.length === 0) {
-      setE2eRunning(false)
-      setE2eActiveStep(null)
-      ;(async () => {
-        try {
-          await fetch('/api/databricks/save-run', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              run_data: {
-                platform: 'databricks',
-                mode: 'e2e',
-                scale_factor: e2eSF,
-                steps: e2eSteps,
-                costs: runCosts,
-                completed_at: new Date().toISOString(),
-              }
-            })
-          })
-        } catch {}
-      })()
-      return
-    }
-    // Don't auto-continue while a spec is being started (prevents race condition)
-    if (e2eStartingRef.current) return
-    // Pop next spec and start it
-    const [next, ...rest] = e2eRemainingSpecs
-    setE2eRemainingSpecs(rest)
-    startE2ERunSpec(next)
-  }, [e2eRunId, e2eRunning, e2eRemainingSpecs])
 
   // Main E2E handler: prereqs then queue all run specs
   async function handleRunE2E() {
