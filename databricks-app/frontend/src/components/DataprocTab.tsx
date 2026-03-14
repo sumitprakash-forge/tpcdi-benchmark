@@ -1140,277 +1140,254 @@ export default function DataprocTab() {
 
       {/* ── Manual Mode ─────────────────────────────────────────────── */}
       {mode === 'manual' && (
-        <>
-          <Section title="Dataproc Cluster & Pipeline Configuration" defaultOpen={true} colorScheme="blue">
-            <div className="pt-4">
-              <div className="flex items-center gap-2 mb-5 p-3 bg-blue-50 border border-blue-200 rounded-lg">
-                <svg className="w-5 h-5 text-blue-500 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                </svg>
-                <p className="text-sm text-blue-700">
-                  3-step pipeline: Batch Load → Incremental Batch 2 → Incremental Batch 3 (sequential, fail-fast). Each step creates its own cluster, runs the job, then deletes the cluster.
-                </p>
-              </div>
+      <>
+      {/* Section 1: GCP & Network Configuration */}
+      <Section title="1. GCP & Network Configuration" defaultOpen={true} colorScheme="emerald">
+        <div className="pt-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            <FormField label="GCP Project">
+              <TextInput value={project} onChange={setProject} placeholder="my-project" />
+            </FormField>
+            <FormField label="Region">
+              <SelectInput
+                value={region}
+                onChange={setRegion}
+                options={[
+                  { value: 'us-central1', label: 'us-central1' },
+                  { value: 'us-east1', label: 'us-east1' },
+                  { value: 'us-west1', label: 'us-west1' },
+                  { value: 'europe-west1', label: 'europe-west1' },
+                  { value: 'asia-east1', label: 'asia-east1' },
+                ]}
+              />
+            </FormField>
+            <FormField label="Zone">
+              <TextInput value={zone} onChange={setZone} placeholder="us-central1-a" />
+            </FormField>
+            <FormField label="Subnet">
+              <TextInput value={subnet} onChange={setSubnet} placeholder="subnet-name" />
+            </FormField>
+            <FormField label="GCS Bucket">
+              <TextInput value={gcsBucket} onChange={setGcsBucket} placeholder="my-bucket" />
+            </FormField>
+            <FormField label="Hive Metastore">
+              <SelectInput
+                value={metastoreMode}
+                onChange={(v) => setMetastoreMode(v as 'spark_default' | 'create' | 'existing')}
+                options={[
+                  { value: 'spark_default', label: 'Spark Default (no external metastore)' },
+                  { value: 'create', label: 'Create Dataproc Metastore' },
+                  { value: 'existing', label: 'Use Existing Metastore' },
+                ]}
+              />
+            </FormField>
+            {metastoreMode === 'create' && (
+              <FormField label="Metastore Name">
+                <TextInput value={metastoreName} onChange={setMetastoreName} placeholder="tpcdi-benchmark-metastore" />
+              </FormField>
+            )}
+            {metastoreMode === 'existing' && (
+              <FormField label="Metastore Service Path">
+                <TextInput value={metastore} onChange={setMetastore} placeholder="projects/.../locations/.../services/..." />
+              </FormField>
+            )}
+          </div>
+        </div>
+      </Section>
 
-              {/* GCP Config */}
-              <h4 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3">GCP & Network</h4>
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
-                <FormField label="GCP Project">
-                  <TextInput value={project} onChange={setProject} placeholder="my-project" />
-                </FormField>
-                <FormField label="Region">
-                  <SelectInput
-                    value={region}
-                    onChange={setRegion}
-                    options={[
-                      { value: 'us-central1', label: 'us-central1' },
-                      { value: 'us-east1', label: 'us-east1' },
-                      { value: 'us-west1', label: 'us-west1' },
-                      { value: 'europe-west1', label: 'europe-west1' },
-                      { value: 'asia-east1', label: 'asia-east1' },
-                    ]}
-                  />
-                </FormField>
-                <FormField label="Zone">
-                  <TextInput value={zone} onChange={setZone} placeholder="us-central1-a" />
-                </FormField>
-                <FormField label="Subnet">
-                  <TextInput value={subnet} onChange={setSubnet} placeholder="subnet-name" />
-                </FormField>
-                <FormField label="GCS Bucket">
-                  <TextInput value={gcsBucket} onChange={setGcsBucket} placeholder="my-bucket" />
-                </FormField>
-                <FormField label="Hive Metastore">
-                  <SelectInput
-                    value={metastoreMode}
-                    onChange={(v) => setMetastoreMode(v as 'spark_default' | 'create' | 'existing')}
-                    options={[
-                      { value: 'spark_default', label: 'Spark Default (no external metastore)' },
-                      { value: 'create', label: 'Create Dataproc Metastore' },
-                      { value: 'existing', label: 'Use Existing Metastore' },
-                    ]}
-                  />
-                </FormField>
-                {metastoreMode === 'create' && (
-                  <FormField label="Metastore Name">
-                    <TextInput value={metastoreName} onChange={setMetastoreName} placeholder="tpcdi-benchmark-metastore" />
-                  </FormField>
-                )}
-                {metastoreMode === 'existing' && (
-                  <FormField label="Metastore Service Path">
-                    <TextInput value={metastore} onChange={setMetastore} placeholder="projects/.../locations/.../services/..." />
-                  </FormField>
-                )}
-              </div>
+      {/* Section 2: Cluster & Job Configuration */}
+      <Section title="2. Cluster & Job Configuration" colorScheme="amber">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 pt-4">
+          <FormField label="Cluster Name (base)">
+            <TextInput value={clusterName} onChange={setClusterName} placeholder="tpcdi-cluster" />
+          </FormField>
+          <FormField label="Master Machine Type">
+            <SelectInput value={masterType} onChange={setMasterType} options={gcpNodeTypes} />
+          </FormField>
+          <FormField label="Worker Machine Type">
+            <SelectInput value={workerType} onChange={setWorkerType} options={gcpNodeTypes} />
+          </FormField>
+          <FormField label="Number of Workers">
+            <NumberInput value={numWorkers} onChange={setNumWorkers} min={1} max={100} />
+          </FormField>
+          <FormField label="Worker SSDs">
+            <NumberInput value={ssdCount} onChange={setSsdCount} min={0} max={8} />
+          </FormField>
+          <FormField label="Scale Factor">
+            <SelectInput
+              value={scaleFactor}
+              onChange={setScaleFactor}
+              options={[
+                { value: '100', label: 'SF 100' },
+                { value: '1000', label: 'SF 1000' },
+                { value: '10000', label: 'SF 10000' },
+              ]}
+            />
+          </FormField>
+          <FormField label="Raw Data Path">
+            <TextInput value={rawDataPath} onChange={setRawDataPath} placeholder="gs://bucket/tpcdi" />
+          </FormField>
+          <FormField label="Target Database">
+            <TextInput value={targetDatabase} onChange={setTargetDatabase} placeholder="tpcdi_warehouse" />
+          </FormField>
+          <FormField label="Metrics Output">
+            <TextInput value={metricsOutput} onChange={setMetricsOutput} placeholder="gs://bucket/metrics" />
+          </FormField>
+        </div>
+      </Section>
 
-              {/* Cluster Config */}
-              <h4 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3">Cluster</h4>
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
-                <FormField label="Cluster Name (base)">
-                  <TextInput value={clusterName} onChange={setClusterName} placeholder="tpcdi-cluster" />
-                </FormField>
-                <FormField label="Master Machine Type">
-                  <SelectInput value={masterType} onChange={setMasterType} options={gcpNodeTypes} />
-                </FormField>
-                <FormField label="Worker Machine Type">
-                  <SelectInput value={workerType} onChange={setWorkerType} options={gcpNodeTypes} />
-                </FormField>
-                <FormField label="Number of Workers">
-                  <NumberInput value={numWorkers} onChange={setNumWorkers} min={1} max={100} />
-                </FormField>
-                <FormField label="Worker SSDs">
-                  <NumberInput value={ssdCount} onChange={setSsdCount} min={0} max={8} />
-                </FormField>
-              </div>
-
-              {/* Job Config (no load_type / batch_id) */}
-              <h4 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3">Job</h4>
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
-                <FormField label="Scale Factor">
-                  <SelectInput
-                    value={scaleFactor}
-                    onChange={setScaleFactor}
-                    options={[
-                      { value: '100', label: 'SF 100' },
-                      { value: '1000', label: 'SF 1000' },
-                      { value: '10000', label: 'SF 10000' },
-                    ]}
-                  />
-                </FormField>
-                <FormField label="Raw Data Path">
-                  <TextInput value={rawDataPath} onChange={setRawDataPath} placeholder="gs://bucket/tpcdi" />
-                </FormField>
-                <FormField label="Target Database">
-                  <TextInput value={targetDatabase} onChange={setTargetDatabase} placeholder="tpcdi_warehouse" />
-                </FormField>
-                <FormField label="Metrics Output">
-                  <TextInput value={metricsOutput} onChange={setMetricsOutput} placeholder="gs://bucket/metrics" />
-                </FormField>
-              </div>
-
-              {/* Pipeline preview */}
-              <div className="mb-4 p-3 bg-blue-50 border border-blue-200 rounded-lg">
-                <p className="text-xs font-semibold text-blue-700 mb-2">Pipeline steps (each creates & deletes its own cluster):</p>
-                <div className="flex flex-wrap gap-3 text-xs text-blue-600">
-                  {MANUAL_PIPELINE_SPECS.map((spec, i) => (
-                    <div key={i} className="bg-white/60 rounded px-2 py-1">
-                      <span className="font-medium">Step {i + 1}:</span> {spec.label} — cluster: <span className="font-mono">{clusterName}{spec.clusterSuffix}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-
-              <div className="mt-5 pt-4 border-t border-slate-100 flex items-center gap-3">
-                <ActionButton
-                  label={manualPipelineRunning ? 'Running Pipeline...' : 'Run Pipeline'}
-                  onClick={handleManualPipeline}
-                  loading={manualPipelineRunning}
-                  disabled={manualPipelineRunning}
-                  variant="secondary"
-                />
-                {manualPipelineRunning && manualRunId && manualRunId !== 'pending' && (
-                  <button
-                    onClick={handleCancelManualPipeline}
-                    disabled={manualCancelling}
-                    className="px-4 py-2 text-sm font-medium rounded-md border border-red-300 text-red-600 hover:bg-red-50 disabled:opacity-50 transition-all"
-                  >
-                    {manualCancelling ? 'Cancelling...' : 'Cancel Run'}
-                  </button>
-                )}
-              </div>
+      {/* Section 3: Run Pipeline */}
+      <Section title="3. Run Pipeline" defaultOpen={true} colorScheme="blue">
+        <div className="pt-4">
+          {/* Pipeline info and controls */}
+          <div className="flex flex-wrap items-end gap-4 mb-6">
+            <div className="text-sm text-slate-600">
+              <span className="font-semibold">3-Step Pipeline:</span> Batch Load &rarr; Incremental Batch 2 &rarr; Incremental Batch 3 (SF {scaleFactor})
             </div>
-          </Section>
+            <ActionButton
+              label={manualPipelineRunning ? 'Running...' : 'Run Pipeline'}
+              onClick={handleManualPipeline}
+              loading={manualPipelineRunning}
+              disabled={manualPipelineRunning}
+            />
+            {manualPipelineRunning && manualRunId && manualRunId !== 'pending' && (
+              <button
+                onClick={handleCancelManualPipeline}
+                disabled={manualCancelling}
+                className="px-4 py-2 text-sm font-medium rounded-md border border-red-300 text-red-600 hover:bg-red-50 disabled:opacity-50 transition-all"
+              >
+                {manualCancelling ? 'Cancelling...' : 'Cancel Run'}
+              </button>
+            )}
+          </div>
 
-          {/* Pipeline Step Progress */}
-          {(manualPipelineRunning || manualPipelineSteps.some(s => s.status !== 'pending')) && (
-            <Section title="Pipeline Progress" defaultOpen={true} colorScheme="slate">
-              <div className="pt-4 space-y-3">
-                {manualPipelineSteps.map((step, i) => (
-                  <div
-                    key={i}
-                    className={`p-4 rounded-lg border transition-all ${
-                      step.status === 'pending' ? 'bg-slate-50 border-slate-200' :
-                      step.status === 'running' ? 'bg-blue-50 border-blue-300 shadow-sm' :
-                      step.status === 'success' ? 'bg-green-50 border-green-300' :
-                      'bg-red-50 border-red-300'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-3">
-                        <span className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold ${
-                          step.status === 'pending' ? 'bg-slate-200 text-slate-500' :
-                          step.status === 'running' ? 'bg-blue-500 text-white animate-pulse' :
-                          step.status === 'success' ? 'bg-green-500 text-white' :
-                          'bg-red-500 text-white'
-                        }`}>
-                          {step.status === 'success' ? '\u2713' : step.status === 'error' ? '!' : i + 1}
-                        </span>
-                        <span className="text-sm font-semibold text-slate-700">{step.name}</span>
-                      </div>
-                      <div className="flex items-center gap-3">
-                        {step.duration_ms !== null && (
-                          <span className="text-xs font-mono text-slate-500">{formatDuration(step.duration_ms)}</span>
-                        )}
-                        <span className={`text-[10px] font-medium uppercase px-2 py-0.5 rounded ${
-                          step.status === 'pending' ? 'bg-slate-200 text-slate-500' :
-                          step.status === 'running' ? 'bg-blue-100 text-blue-700' :
-                          step.status === 'success' ? 'bg-green-100 text-green-700' :
-                          'bg-red-100 text-red-700'
-                        }`}>
-                          {step.status}
-                        </span>
-                      </div>
-                    </div>
-                    {step.output && (
-                      <p className="mt-2 text-xs text-slate-600 ml-10 break-words">{step.output}</p>
+          {/* Step Progress Cards */}
+          <div className="space-y-3">
+            {manualPipelineSteps.map((step, i) => (
+              <div
+                key={i}
+                className={`p-4 rounded-lg border transition-all ${
+                  step.status === 'pending' ? 'bg-slate-50 border-slate-200' :
+                  step.status === 'running' ? 'bg-blue-50 border-blue-300 shadow-sm' :
+                  step.status === 'success' ? 'bg-green-50 border-green-300' :
+                  'bg-red-50 border-red-300'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-3">
+                    <span className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold ${
+                      step.status === 'pending' ? 'bg-slate-200 text-slate-500' :
+                      step.status === 'running' ? 'bg-blue-500 text-white animate-pulse' :
+                      step.status === 'success' ? 'bg-green-500 text-white' :
+                      'bg-red-500 text-white'
+                    }`}>
+                      {step.status === 'success' ? '\u2713' : step.status === 'error' ? '!' : i + 1}
+                    </span>
+                    <span className="text-sm font-semibold text-slate-700">Step {i + 1}: {step.name}</span>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    {step.duration_ms !== null && (
+                      <span className="text-xs font-mono text-slate-500">{formatDuration(step.duration_ms)}</span>
+                    )}
+                    {manualCosts[i] && (
+                      <span className="text-xs font-mono text-blue-600">{formatCost(manualCosts[i]!.total_cost_usd)}</span>
                     )}
                     {step.link && (
-                      <a href={step.link} target="_blank" rel="noopener noreferrer"
-                        className="mt-1 ml-10 inline-block text-xs text-blue-600 hover:text-blue-700 underline">
+                      <a
+                        href={step.link}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-xs text-blue-600 hover:text-blue-700 underline"
+                      >
                         View in GCP Console
                       </a>
                     )}
+                    <span className={`text-[10px] font-medium uppercase px-2 py-0.5 rounded ${
+                      step.status === 'pending' ? 'bg-slate-200 text-slate-500' :
+                      step.status === 'running' ? 'bg-blue-100 text-blue-700' :
+                      step.status === 'success' ? 'bg-green-100 text-green-700' :
+                      'bg-red-100 text-red-700'
+                    }`}>
+                      {step.status}
+                    </span>
                   </div>
-                ))}
-              </div>
-
-              {/* Cost Breakdown */}
-              {manualCosts.some(c => c !== null) && (
-                <div className="mt-6 space-y-4">
-                  {(() => {
-                    const totalCost = manualCosts.reduce((sum, c) => sum + (c?.total_cost_usd || 0), 0)
-                    const totalDuration = manualCosts.reduce((sum, c) => sum + (c?.duration_ms || 0), 0)
-                    return (
-                      <div className="p-4 bg-gradient-to-r from-blue-50 to-cyan-50 rounded-lg border border-blue-200">
-                        <div className="flex items-center justify-between">
-                          <h4 className="text-sm font-bold text-blue-800">Pipeline Total</h4>
-                          <div className="flex items-center gap-6">
-                            <div className="text-right">
-                              <p className="text-[10px] text-blue-600 uppercase">Total Cost</p>
-                              <p className="text-xl font-bold text-blue-700">{formatCost(totalCost)}</p>
-                            </div>
-                            <div className="text-right">
-                              <p className="text-[10px] text-blue-600 uppercase">Total Duration</p>
-                              <p className="text-xl font-bold text-blue-700">{formatDuration(totalDuration)}</p>
-                            </div>
-                            {totalDuration > 0 && (
-                              <div className="text-right">
-                                <p className="text-[10px] text-blue-600 uppercase">Avg $/hr</p>
-                                <p className="text-xl font-bold text-blue-700">
-                                  ${(totalCost / (totalDuration / 3_600_000)).toFixed(2)}
-                                </p>
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                      </div>
-                    )
-                  })()}
-                  {manualCosts.map((cost, ci) => {
-                    if (!cost) return null
-                    const labels = ['Batch Load', 'Incremental Load - Batch 2', 'Incremental Load - Batch 3']
-                    return (
-                      <div key={ci} className="p-4 bg-gradient-to-r from-slate-50 to-blue-50 rounded-lg border border-slate-200">
-                        <div className="flex items-center justify-between mb-3">
-                          <h4 className="text-sm font-bold text-slate-700">{labels[ci]} (SF {scaleFactor})</h4>
-                          {cost.duration_hours > 0 && (
-                            <span className="text-[10px] text-slate-400 font-mono">
-                              ${(cost.total_cost_usd / cost.duration_hours).toFixed(2)}/hr
-                            </span>
-                          )}
-                        </div>
-                        <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-                          <div className="bg-white rounded-lg p-2.5 border border-slate-100">
-                            <p className="text-[10px] text-slate-500 uppercase">VM Compute</p>
-                            <p className="text-base font-bold text-slate-800">{formatCost(cost.vm_cost_usd)}</p>
-                          </div>
-                          <div className="bg-white rounded-lg p-2.5 border border-slate-100">
-                            <p className="text-[10px] text-slate-500 uppercase">Dataproc Premium</p>
-                            <p className="text-base font-bold text-slate-800">{formatCost(cost.dataproc_premium_usd)}</p>
-                          </div>
-                          <div className="bg-white rounded-lg p-2.5 border border-slate-100">
-                            <p className="text-[10px] text-slate-500 uppercase">Local SSD</p>
-                            <p className="text-base font-bold text-slate-800">{formatCost(cost.ssd_cost_usd)}</p>
-                            <p className="text-[9px] text-slate-400">{cost.cluster.ssd_count} SSD(s)</p>
-                          </div>
-                          <div className="bg-white rounded-lg p-2.5 border border-blue-200 bg-blue-50">
-                            <p className="text-[10px] text-blue-600 uppercase font-semibold">Total</p>
-                            <p className="text-base font-bold text-blue-700">{formatCost(cost.total_cost_usd)}</p>
-                          </div>
-                          <div className="bg-white rounded-lg p-2.5 border border-slate-100">
-                            <p className="text-[10px] text-slate-500 uppercase">Duration</p>
-                            <p className="text-sm font-mono text-slate-700">{formatDuration(cost.duration_ms)}</p>
-                            <p className="text-[9px] text-slate-400">{cost.cluster.worker_type} x{cost.cluster.num_workers}</p>
-                          </div>
-                        </div>
-                      </div>
-                    )
-                  })}
                 </div>
-              )}
-            </Section>
+                {step.output && (
+                  <p className="mt-2 text-xs text-slate-600 ml-10 break-words">{step.output}</p>
+                )}
+              </div>
+            ))}
+          </div>
+
+          {/* Cost Breakdown - per step */}
+          {manualCosts.some(c => c !== null) && (
+            <div className="mt-6 space-y-4">
+              {(() => {
+                const totalCost = manualCosts.reduce((sum, c) => sum + (c?.total_cost_usd || 0), 0)
+                const totalDuration = manualCosts.reduce((sum, c) => sum + (c?.duration_ms || 0), 0)
+                return (
+                  <div className="p-4 bg-gradient-to-r from-blue-50 to-cyan-50 rounded-lg border border-blue-200">
+                    <div className="flex items-center justify-between">
+                      <h4 className="text-sm font-bold text-blue-800">Pipeline Total</h4>
+                      <div className="flex items-center gap-6">
+                        <div className="text-right">
+                          <p className="text-[10px] text-blue-600 uppercase">Total Cost</p>
+                          <p className="text-xl font-bold text-blue-700">{formatCost(totalCost)}</p>
+                        </div>
+                        <div className="text-right">
+                          <p className="text-[10px] text-blue-600 uppercase">Total Duration</p>
+                          <p className="text-xl font-bold text-blue-700">{formatDuration(totalDuration)}</p>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )
+              })()}
+              {manualCosts.map((cost, ci) => {
+                if (!cost) return null
+                const labels = ['Batch Load', 'Incremental Load - Batch 2', 'Incremental Load - Batch 3']
+                return (
+                  <div key={ci} className="p-4 bg-gradient-to-r from-slate-50 to-blue-50 rounded-lg border border-slate-200">
+                    <div className="flex items-center justify-between mb-3">
+                      <h4 className="text-sm font-bold text-slate-700">{labels[ci]} (SF {scaleFactor})</h4>
+                      {cost.duration_hours > 0 && (
+                        <span className="text-[10px] text-slate-400 font-mono">
+                          ${(cost.total_cost_usd / cost.duration_hours).toFixed(2)}/hr
+                        </span>
+                      )}
+                    </div>
+                    <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+                      <div className="bg-white rounded-lg p-2.5 border border-slate-100">
+                        <p className="text-[10px] text-slate-500 uppercase">VM Compute</p>
+                        <p className="text-base font-bold text-slate-800">{formatCost(cost.vm_cost_usd)}</p>
+                      </div>
+                      <div className="bg-white rounded-lg p-2.5 border border-slate-100">
+                        <p className="text-[10px] text-slate-500 uppercase">Dataproc Premium</p>
+                        <p className="text-base font-bold text-slate-800">{formatCost(cost.dataproc_premium_usd)}</p>
+                      </div>
+                      <div className="bg-white rounded-lg p-2.5 border border-slate-100">
+                        <p className="text-[10px] text-slate-500 uppercase">Local SSD</p>
+                        <p className="text-base font-bold text-slate-800">{formatCost(cost.ssd_cost_usd)}</p>
+                        <p className="text-[9px] text-slate-400">{cost.cluster.ssd_count} SSD(s)</p>
+                      </div>
+                      <div className="bg-white rounded-lg p-2.5 border border-blue-200 bg-blue-50">
+                        <p className="text-[10px] text-blue-600 uppercase font-semibold">Total</p>
+                        <p className="text-base font-bold text-blue-700">{formatCost(cost.total_cost_usd)}</p>
+                      </div>
+                      <div className="bg-white rounded-lg p-2.5 border border-slate-100">
+                        <p className="text-[10px] text-slate-500 uppercase">Duration</p>
+                        <p className="text-sm font-mono text-slate-700">{formatDuration(cost.duration_ms)}</p>
+                        <p className="text-[9px] text-slate-400">{cost.cluster.worker_type} x{cost.cluster.num_workers}</p>
+                      </div>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
           )}
-        </>
+        </div>
+      </Section>
+      </>
       )}
     </div>
   )
