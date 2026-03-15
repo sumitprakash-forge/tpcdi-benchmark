@@ -341,6 +341,7 @@ export default function DataprocTab() {
   }
 
   const e2eCancelledRef = useRef(false)
+  const [e2eNextSpec, setE2eNextSpec] = useState<E2ERunSpec | null>(null)
 
   function buildRunLabel(spec: E2ERunSpec, sf: number): string {
     const sizing = getDataprocSizing(sf, spec.loadType)
@@ -483,34 +484,33 @@ export default function DataprocTab() {
             })
           }
           setE2eRunId(null)
-          // Auto-continue: start next spec directly
+          // Signal auto-continue by popping next spec
           setE2eRemainingSpecs(prev => {
-            if (e2eCancelledRef.current || prev.length === 0) {
-              if (prev.length === 0) {
-                setE2eRunning(false)
-                setE2eActiveStep(null)
-                fetch('/api/databricks/save-run', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({
-                    run_data: {
-                      platform: 'dataproc',
-                      mode: 'e2e',
-                      scale_factor: e2eSF,
-                      steps: e2eSteps,
-                      costs: runCosts,
-                      completed_at: new Date().toISOString(),
-                    }
-                  })
-                }).catch(() => {})
-              }
-              if (e2eCancelledRef.current) {
-                setE2eRunning(false)
-              }
-              return prev.length === 0 ? prev : []
+            if (e2eCancelledRef.current) {
+              setE2eRunning(false)
+              return []
+            }
+            if (prev.length === 0) {
+              setE2eRunning(false)
+              setE2eActiveStep(null)
+              fetch('/api/databricks/save-run', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  run_data: {
+                    platform: 'dataproc',
+                    mode: 'e2e',
+                    scale_factor: e2eSF,
+                    steps: e2eSteps,
+                    costs: runCosts,
+                    completed_at: new Date().toISOString(),
+                  }
+                })
+              }).catch(() => {})
+              return prev
             }
             const [next, ...rest] = prev
-            setTimeout(() => startE2ERunSpec(next), 0)
+            setE2eNextSpec(next)
             return rest
           })
           return true
@@ -539,6 +539,14 @@ export default function DataprocTab() {
     }, 10000)
     return () => clearInterval(interval)
   }, [e2eRunId, e2eActiveStep])
+
+  // Auto-continue: when e2eNextSpec is set, start the next run
+  useEffect(() => {
+    if (!e2eNextSpec) return
+    const spec = e2eNextSpec
+    setE2eNextSpec(null)
+    startE2ERunSpec(spec)
+  }, [e2eNextSpec])
 
   // Main E2E handler
   async function handleRunE2E() {

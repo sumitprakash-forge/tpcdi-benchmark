@@ -550,6 +550,7 @@ export default function DatabricksTab() {
 
   const e2eCancelledRef = useRef(false)
   const e2eStartingRef = useRef(false)  // gates auto-continue while a spec is being kicked off
+  const [e2eNextSpec, setE2eNextSpec] = useState<E2ERunSpec | null>(null)
 
   // Build run label from spec
   function buildRunLabel(spec: E2ERunSpec, sf: number): string {
@@ -673,36 +674,34 @@ export default function DatabricksTab() {
             setE2eActiveStep(null)
             setE2eRemainingSpecs([])
           } else {
-            // Auto-continue: start next spec directly from polling callback
+            // Signal auto-continue by popping next spec
             setE2eRemainingSpecs(prev => {
-              if (e2eCancelledRef.current || prev.length === 0) {
-                // Pipeline complete or cancelled
-                if (prev.length === 0) {
-                  setE2eRunning(false)
-                  setE2eActiveStep(null)
-                  fetch('/api/databricks/save-run', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                      run_data: {
-                        platform: 'databricks',
-                        mode: 'e2e',
-                        scale_factor: e2eSF,
-                        steps: e2eSteps,
-                        costs: runCosts,
-                        completed_at: new Date().toISOString(),
-                      }
-                    })
-                  }).catch(() => {})
-                }
-                if (e2eCancelledRef.current) {
-                  setE2eRunning(false)
-                }
-                return prev.length === 0 ? prev : []
+              if (e2eCancelledRef.current) {
+                setE2eRunning(false)
+                return []
+              }
+              if (prev.length === 0) {
+                // Pipeline complete — save and stop
+                setE2eRunning(false)
+                setE2eActiveStep(null)
+                fetch('/api/databricks/save-run', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    run_data: {
+                      platform: 'databricks',
+                      mode: 'e2e',
+                      scale_factor: e2eSF,
+                      steps: e2eSteps,
+                      costs: runCosts,
+                      completed_at: new Date().toISOString(),
+                    }
+                  })
+                }).catch(() => {})
+                return prev
               }
               const [next, ...rest] = prev
-              // Kick off next spec asynchronously
-              setTimeout(() => startE2ERunSpec(next), 0)
+              setE2eNextSpec(next)
               return rest
             })
           }
@@ -722,6 +721,14 @@ export default function DatabricksTab() {
     }, 10000)
     return () => clearInterval(interval)
   }, [e2eRunId, e2eActiveStep])
+
+  // Auto-continue: when e2eNextSpec is set, start the next run
+  useEffect(() => {
+    if (!e2eNextSpec) return
+    const spec = e2eNextSpec
+    setE2eNextSpec(null)
+    startE2ERunSpec(spec)
+  }, [e2eNextSpec])
 
   // Main E2E handler: prereqs then queue all run specs
   async function handleRunE2E() {
