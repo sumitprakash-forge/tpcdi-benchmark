@@ -11,6 +11,17 @@ from server import run_history
 
 router = APIRouter()
 
+
+def _resolve_notebook_path(w, notebook_name: str) -> str:
+    """Resolve notebook path using the SP's workspace identity (same as bootstrap)."""
+    try:
+        me = w.current_user.me()
+        sp_identity = me.user_name or str(me.id)
+    except Exception:
+        sp_identity = "sumit.prakash@databricks.com"
+    return f"/Workspace/Users/{sp_identity}/tpcdi-benchmark/databricks/{notebook_name}"
+
+
 # Notebooks live in the repo (not bundled with the app).
 # Bootstrap verifies they exist at the workspace repo path.
 
@@ -931,7 +942,7 @@ async def create_job(req: JobCreateRequest, request: Request):
                     "job_cluster_key": "benchmark_cluster",
                     "libraries": [{"jar": jar_path}],
                     "notebook_task": {
-                        "notebook_path": req.notebook_path or "/Workspace/Users/sumit.prakash@databricks.com/tpcdi-benchmark/databricks/benchmark_databricks_notebook",
+                        "notebook_path": req.notebook_path or _resolve_notebook_path(w, "benchmark_databricks_notebook"),
                         "base_parameters": base_parameters,
                         "source": "WORKSPACE",
                     },
