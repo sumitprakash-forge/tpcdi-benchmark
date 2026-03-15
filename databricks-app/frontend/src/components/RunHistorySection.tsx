@@ -11,12 +11,15 @@ interface RunHistoryStep {
 interface RunHistoryEntry {
   platform: string
   mode: string
+  flow_type?: string
   scale_factor: string | number
   steps: RunHistoryStep[]
   costs: (null | { total_cost_usd?: number; [key: string]: any })[]
   completed_at: string
   saved_at: string
   user_email?: string
+  run_by?: string
+  run_by_email?: string
   _filename: string
   status?: string
   run_id?: string
@@ -105,6 +108,30 @@ export default function RunHistorySection({ platform }: RunHistorySectionProps) 
     return entry.steps.filter(s => s.status === 'success').length
   }
 
+  const totalDurationForEntry = (entry: RunHistoryEntry): number | null => {
+    if (entry.total_duration_ms) return entry.total_duration_ms
+    if (!entry.steps || entry.steps.length === 0) return null
+    let sum = 0
+    let hasAny = false
+    for (const s of entry.steps) {
+      if (s.duration_ms != null) { sum += s.duration_ms; hasAny = true }
+    }
+    return hasAny ? sum : null
+  }
+
+  const jobDurationForEntry = (entry: RunHistoryEntry): number | null => {
+    if (!entry.steps || entry.steps.length === 0) return null
+    let sum = 0
+    let hasAny = false
+    for (const s of entry.steps) {
+      // Skip prereq/check steps — only count actual job runs
+      const name = (s.name || '').toLowerCase()
+      if (name.includes('prereq') || name.includes('check') || name.includes('gcloud') || name.includes('network')) continue
+      if (s.duration_ms != null) { sum += s.duration_ms; hasAny = true }
+    }
+    return hasAny ? sum : null
+  }
+
   const statusDot = (status: string) => {
     if (status === 'success') return 'bg-green-400'
     if (status === 'error' || status === 'failed') return 'bg-red-400'
@@ -172,11 +199,14 @@ export default function RunHistorySection({ platform }: RunHistorySectionProps) 
               <thead>
                 <tr className="bg-slate-50 text-left text-slate-500 uppercase tracking-wide">
                   <th className="px-4 py-2 w-8"></th>
-                  <th className="px-4 py-2">Mode</th>
+                  <th className="px-4 py-2">Flow</th>
                   <th className="px-4 py-2">Scale Factor</th>
+                  <th className="px-4 py-2">Run By</th>
                   <th className="px-4 py-2">Status</th>
                   <th className="px-4 py-2">Steps</th>
                   <th className="px-4 py-2">Total Cost</th>
+                  <th className="px-4 py-2">Total Duration</th>
+                  <th className="px-4 py-2">Job Duration</th>
                   <th className="px-4 py-2">Saved</th>
                   <th className="px-4 py-2 w-16"></th>
                 </tr>
@@ -185,6 +215,8 @@ export default function RunHistorySection({ platform }: RunHistorySectionProps) 
                 {entries.map((entry) => {
                   const isExpanded = expandedRow === entry._filename
                   const cost = totalCostForEntry(entry)
+                  const totalDur = totalDurationForEntry(entry)
+                  const jobDur = jobDurationForEntry(entry)
                   const savedTime = entry.saved_at || entry.completed_at || entry.timestamp
                   return (
                     <Fragment key={entry._filename}>
@@ -200,8 +232,17 @@ export default function RunHistorySection({ platform }: RunHistorySectionProps) 
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
                           </svg>
                         </td>
-                        <td className="px-4 py-2 capitalize text-slate-700">{entry.mode || 'e2e'}</td>
+                        <td className="px-4 py-2 text-slate-700">
+                          <span className={`inline-block px-2 py-0.5 text-[10px] font-semibold rounded ${
+                            (entry.flow_type || entry.mode) === 'e2e' ? 'bg-purple-100 text-purple-700' : 'bg-slate-100 text-slate-600'
+                          }`}>
+                            {(entry.flow_type || entry.mode || 'e2e').toUpperCase()}
+                          </span>
+                        </td>
                         <td className="px-4 py-2 text-slate-700">SF {entry.scale_factor}</td>
+                        <td className="px-4 py-2 text-slate-600 truncate max-w-[140px]" title={entry.run_by_email || entry.run_by || entry.user_email || ''}>
+                          {entry.run_by || entry.user_email || '--'}
+                        </td>
                         <td className="px-4 py-2">
                           <span className={`flex items-center gap-1.5`}>
                             <span className={`w-2 h-2 rounded-full ${entry.status === 'completed' ? 'bg-green-400' : entry.status === 'failed' ? 'bg-red-400' : 'bg-yellow-400'}`} />
@@ -212,7 +253,13 @@ export default function RunHistorySection({ platform }: RunHistorySectionProps) 
                           {entry.steps ? `${completedSteps(entry)} / ${entry.steps.length}` : '--'}
                         </td>
                         <td className="px-4 py-2 font-mono font-medium text-slate-800">
-                          {cost != null ? `$${cost.toFixed(2)}` : entry.total_duration_ms ? formatDurationMs(entry.total_duration_ms) : '--'}
+                          {cost != null ? `$${cost.toFixed(2)}` : '--'}
+                        </td>
+                        <td className="px-4 py-2 font-mono text-slate-700">
+                          {formatDurationMs(totalDur)}
+                        </td>
+                        <td className="px-4 py-2 font-mono text-slate-700">
+                          {formatDurationMs(jobDur)}
                         </td>
                         <td className="px-4 py-2 text-slate-400">
                           {savedTime ? new Date(savedTime).toLocaleString() : '--'}
@@ -240,7 +287,7 @@ export default function RunHistorySection({ platform }: RunHistorySectionProps) 
 
                       {isExpanded && entry.steps && (
                         <tr className="bg-slate-50">
-                          <td colSpan={8} className="px-6 py-4">
+                          <td colSpan={11} className="px-6 py-4">
                             <table className="w-full text-xs">
                               <thead>
                                 <tr className="text-left text-slate-400 uppercase tracking-wide">

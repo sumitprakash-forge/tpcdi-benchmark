@@ -20,6 +20,31 @@ def get_workspace_client(request: Request = None) -> WorkspaceClient:
     return WorkspaceClient()
 
 
+def get_workspace_client_with_token(token: str) -> WorkspaceClient:
+    """Get WorkspaceClient authenticated with a specific PAT token.
+
+    Must explicitly set credentials_provider to prevent SDK from
+    auto-detecting SP OAuth env vars (DATABRICKS_CLIENT_ID/SECRET).
+    """
+    from databricks.sdk.config import Config
+    host = get_workspace_host()
+    if not host:
+        if IS_DATABRICKS_APP:
+            host = f"https://{os.environ.get('DATABRICKS_HOST', '')}"
+        else:
+            w = get_workspace_client()
+            host = str(w.config.host)
+    config = Config(
+        host=host,
+        token=token,
+        # Explicitly clear OAuth fields so SDK doesn't see multiple auth methods
+        client_id=None,
+        client_secret=None,
+        auth_type="pat",
+    )
+    return WorkspaceClient(config=config)
+
+
 def get_user_email(request: Request = None) -> str:
     """Get the logged-in user's email from Databricks Apps proxy headers."""
     if request:

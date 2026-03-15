@@ -218,6 +218,12 @@ export default function DataprocTab() {
   const [tokenInput, setTokenInput] = useState('')
   const [tokenType, setTokenType] = useState<'refresh_token' | 'access_token' | 'adc_json'>('refresh_token')
 
+  // Mandatory GCP refresh token (persisted in localStorage, auto-refreshes before every run)
+  const [gcpRefreshToken, setGcpRefreshToken] = useState(() => localStorage.getItem('tpcdi_gcp_refresh_token') || '')
+  const [gcpTokenUser, setGcpTokenUser] = useState<string | null>(null)
+  const [gcpTokenValidating, setGcpTokenValidating] = useState(false)
+  const [gcpTokenError, setGcpTokenError] = useState<string | null>(null)
+
   // E2E state - restore from localStorage
   const savedE2E = useRef<E2EPersistedState | null>((() => {
     try {
@@ -232,6 +238,7 @@ export default function DataprocTab() {
   const [e2eActiveStep, setE2eActiveStep] = useState<number | null>(savedE2E.current?.activeStep || null)
   const [runCosts, setRunCosts] = useState<(DataprocRunCost | null)[]>(savedE2E.current?.costs || [null, null, null])
   const [e2eRemainingSpecs, setE2eRemainingSpecs] = useState<E2ERunSpec[]>(savedE2E.current?.remainingSpecs || [])
+  const [e2eSaveNeeded, setE2eSaveNeeded] = useState(false)
 
   // Persist E2E state
   useEffect(() => {
@@ -241,6 +248,30 @@ export default function DataprocTab() {
     }
     localStorage.setItem(E2E_STATE_KEY, JSON.stringify(state))
   }, [e2eSteps, e2eSF, e2eRunId, e2eActiveStep, e2eRunning, runCosts, e2eRemainingSpecs])
+
+  // Auto-save Dataproc E2E run history when pipeline completes (uses fresh state)
+  useEffect(() => {
+    if (!e2eSaveNeeded) return
+    setE2eSaveNeeded(false)
+    const hasSuccess = e2eSteps.some(s => s.status === 'success')
+    if (!hasSuccess) return
+    fetch('/api/databricks/save-run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        run_data: {
+          platform: 'dataproc',
+          mode: 'e2e',
+          flow_type: 'e2e',
+          scale_factor: e2eSF,
+          steps: e2eSteps,
+          costs: runCosts,
+          completed_at: new Date().toISOString(),
+          status: e2eSteps.every(s => s.status === 'success') ? 'completed' : 'failed',
+        }
+      })
+    }).catch(() => {})
+  }, [e2eSaveNeeded, e2eSteps, e2eSF, runCosts])
 
   // Loading / Toast
   const [toasts, setToasts] = useState<ToastMessage[]>([])
@@ -335,6 +366,38 @@ export default function DataprocTab() {
     addToast('Google Cloud credentials cleared', 'info')
   }
 
+  // ── GCP Refresh Token validation (debounced) ────────────────────────
+  useEffect(() => {
+    localStorage.setItem('tpcdi_gcp_refresh_token', gcpRefreshToken)
+    if (!gcpRefreshToken.trim()) {
+      setGcpTokenUser(null)
+      setGcpTokenError(null)
+      return
+    }
+    setGcpTokenValidating(true)
+    setGcpTokenError(null)
+    setGcpTokenUser(null)
+    const timer = setTimeout(async () => {
+      try {
+        const data = await apiCall('/api/dataproc/auth/login', {
+          method: 'POST',
+          body: JSON.stringify({ token: gcpRefreshToken.trim(), token_type: 'refresh_token' }),
+        })
+        if (data.status === 'authenticated') {
+          setGcpTokenUser(data.account || 'unknown')
+          setGcpAuth(data)
+        } else {
+          setGcpTokenError(data.message || 'Invalid token')
+        }
+      } catch (e: any) {
+        setGcpTokenError(e.message || 'Invalid token')
+      } finally {
+        setGcpTokenValidating(false)
+      }
+    }, 800)
+    return () => clearTimeout(timer)
+  }, [gcpRefreshToken])
+
   // ── E2E helpers ──────────────────────────────────────────────────────
 
   function updateE2EStep(index: number, updates: Partial<E2EStep>) {
@@ -383,6 +446,7 @@ export default function DataprocTab() {
           raw_data_path: rawDataPath,
           target_database: targetDatabase,
           metrics_output: metricsOutput,
+          gcp_refresh_token: gcpRefreshToken.trim(),
         }),
       })
       setE2eRunId(result.run_id)
@@ -494,20 +558,7 @@ export default function DataprocTab() {
             if (prev.length === 0) {
               setE2eRunning(false)
               setE2eActiveStep(null)
-              fetch('/api/databricks/save-run', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  run_data: {
-                    platform: 'dataproc',
-                    mode: 'e2e',
-                    scale_factor: e2eSF,
-                    steps: e2eSteps,
-                    costs: runCosts,
-                    completed_at: new Date().toISOString(),
-                  }
-                })
-              }).catch(() => {})
+              setE2eSaveNeeded(true)
               return prev
             }
             const [next, ...rest] = prev
@@ -561,17 +612,31 @@ export default function DataprocTab() {
     e2eCancelledRef.current = false
 
     // Step 0: Check Google auth & verify/create prerequisites (VPC, subnet, NAT, GCS bucket)
-    updateE2EStep(0, { status: 'running', output: 'Checking Google Cloud authentication and prerequisites...' })
+    updateE2EStep(0, { status: 'running', output: 'Refreshing Google Cloud credentials and checking prerequisites...' })
     const step0Start = Date.now()
     try {
-      const auth = await apiCall('/api/dataproc/auth/status')
-      if (auth.status !== 'authenticated') {
-        updateE2EStep(0, { status: 'error', output: `Not authenticated with Google Cloud: ${auth.message}. Please sign in first.`, duration_ms: Date.now() - step0Start })
-        setE2eRunning(false)
-        return
+      // Auto-refresh: if refresh token is provided, re-authenticate first
+      if (gcpRefreshToken.trim()) {
+        const refreshResult = await apiCall('/api/dataproc/auth/login', {
+          method: 'POST',
+          body: JSON.stringify({ token: gcpRefreshToken.trim(), token_type: 'refresh_token' }),
+        })
+        if (refreshResult.status !== 'authenticated') {
+          updateE2EStep(0, { status: 'error', output: `GCP token refresh failed: ${refreshResult.message}`, duration_ms: Date.now() - step0Start })
+          setE2eRunning(false)
+          return
+        }
+        setGcpAuth(refreshResult)
+        updateE2EStep(0, { output: `Authenticated as ${refreshResult.account}. Checking & creating prerequisites...` })
+      } else {
+        const auth = await apiCall('/api/dataproc/auth/status')
+        if (auth.status !== 'authenticated') {
+          updateE2EStep(0, { status: 'error', output: `Not authenticated with Google Cloud: ${auth.message}. Please provide a GCP Refresh Token.`, duration_ms: Date.now() - step0Start })
+          setE2eRunning(false)
+          return
+        }
+        updateE2EStep(0, { output: `Authenticated as ${auth.account}. Checking & creating prerequisites...` })
       }
-
-      updateE2EStep(0, { output: `Authenticated as ${auth.account}. Checking & creating prerequisites...` })
 
       const prereqs = await apiCall('/api/dataproc/verify-prerequisites', {
         method: 'POST',
@@ -580,6 +645,7 @@ export default function DataprocTab() {
           metastore_mode: metastoreMode,
           metastore_name: metastoreName,
           metastore_path: metastore,
+          gcp_refresh_token: gcpRefreshToken.trim(),
         }),
       })
 
@@ -672,6 +738,7 @@ export default function DataprocTab() {
           raw_data_path: rawDataPath,
           target_database: targetDatabase,
           metrics_output: metricsOutput,
+          gcp_refresh_token: gcpRefreshToken.trim(),
         }),
       })
       setManualRunId(result.run_id)
@@ -977,90 +1044,64 @@ export default function DataprocTab() {
         <Toast key={t.id} message={t.message} type={t.type} onClose={() => removeToast(t.id)} />
       ))}
 
-      {/* Google Cloud Auth Banner */}
+      {/* GCP Refresh Token (mandatory, auto-refreshes before every run) */}
       <div className={`mb-4 p-4 rounded-lg border ${
-        gcpAuth?.status === 'authenticated'
-          ? 'bg-green-50 border-green-200'
-          : 'bg-amber-50 border-amber-200'
+        gcpTokenUser ? 'bg-green-50 border-green-200'
+          : gcpTokenError ? 'bg-red-50 border-red-200'
+          : 'bg-slate-50 border-slate-200'
       }`}>
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2 text-sm">
-            <span className={`w-2.5 h-2.5 rounded-full ${gcpAuth?.status === 'authenticated' ? 'bg-green-500' : 'bg-amber-500'}`} />
-            {gcpAuth?.status === 'authenticated' ? (
-              <span className="text-green-700">
-                Google Cloud: <span className="font-medium">{gcpAuth.account}</span>
-                <span className="text-green-500 ml-1">({gcpAuth.method})</span>
-              </span>
-            ) : (
-              <span className="text-amber-700">
-                {gcpAuth?.message || 'Not authenticated with Google Cloud'}
-              </span>
+        <div className="mb-2">
+          <div className="flex items-center gap-2 mb-1">
+            <span className="text-sm font-semibold text-slate-700">GCP Refresh Token</span>
+            <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-red-100 text-red-600">REQUIRED</span>
+            {gcpTokenValidating && (
+              <svg className="w-3.5 h-3.5 animate-spin text-blue-500" viewBox="0 0 24 24" fill="none">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+              </svg>
             )}
           </div>
-          <div className="flex items-center gap-2">
-            {gcpAuth?.status === 'authenticated' ? (
-              <button onClick={handleLogout} className="text-xs text-red-500 hover:text-red-700 underline">Sign out</button>
-            ) : (
-              <button
-                onClick={() => setShowTokenInput(!showTokenInput)}
-                className="px-3 py-1.5 text-xs font-medium bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors"
-              >
-                Sign in with Google
-              </button>
-            )}
-            <button onClick={checkGcpAuth} disabled={loadingAuth} className="text-xs text-slate-500 underline hover:text-slate-700">
-              {loadingAuth ? '...' : 'Refresh'}
-            </button>
-          </div>
+          <p className="text-[11px] text-slate-500">
+            Auto-refreshes before every run. Get it from: <code className="bg-slate-100 px-1 rounded text-[10px]">cat ~/.config/gcloud/application_default_credentials.json</code> (copy the <code className="bg-slate-100 px-1 rounded text-[10px]">refresh_token</code> field)
+          </p>
         </div>
-
-        {/* Token input form */}
-        {showTokenInput && gcpAuth?.status !== 'authenticated' && (
-          <div className="mt-4 pt-3 border-t border-amber-200">
-            <div className="mb-3">
-              <p className="text-xs text-slate-600 mb-2">
-                Provide your Google Cloud credentials. The easiest way:
-              </p>
-              <ol className="text-xs text-slate-500 list-decimal ml-4 space-y-1">
-                <li>Run <code className="bg-slate-100 px-1 rounded text-[11px]">cat ~/.config/gcloud/application_default_credentials.json</code> on your machine</li>
-                <li>Select <strong>ADC JSON</strong> below and paste the full JSON content</li>
-                <li>Or run <code className="bg-slate-100 px-1 rounded text-[11px]">gcloud auth print-access-token</code> and paste as <strong>Access Token</strong> (expires in 1hr)</li>
-              </ol>
-            </div>
-            <div className="flex items-end gap-3">
-              <div className="flex-shrink-0">
-                <label className="block text-[10px] font-medium text-slate-500 uppercase mb-1">Token Type</label>
-                <select
-                  value={tokenType}
-                  onChange={(e) => setTokenType(e.target.value as any)}
-                  className="px-2 py-2 text-xs border border-slate-300 rounded-md bg-white"
-                >
-                  <option value="adc_json">ADC JSON</option>
-                  <option value="refresh_token">Refresh Token</option>
-                  <option value="access_token">Access Token</option>
-                </select>
+        <div className="flex items-center gap-3">
+          <div className="flex-1 relative">
+            <input
+              type="password"
+              value={gcpRefreshToken}
+              onChange={(e) => setGcpRefreshToken(e.target.value)}
+              placeholder="1//0xxx... (from application_default_credentials.json)"
+              className={`w-full px-3 py-2 text-xs font-mono border rounded-md bg-white focus:ring-2 focus:outline-none ${
+                gcpTokenUser ? 'border-green-300 focus:ring-green-300' :
+                gcpTokenError ? 'border-red-300 focus:ring-red-300' :
+                'border-slate-300 focus:ring-blue-400'
+              }`}
+            />
+            {gcpTokenUser && (
+              <div className="absolute right-2 top-1/2 -translate-y-1/2">
+                <svg className="w-4 h-4 text-green-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                </svg>
               </div>
-              <div className="flex-1">
-                <label className="block text-[10px] font-medium text-slate-500 uppercase mb-1">
-                  {tokenType === 'adc_json' ? 'Paste full JSON' : tokenType === 'refresh_token' ? 'Refresh Token' : 'Access Token'}
-                </label>
-                <textarea
-                  value={tokenInput}
-                  onChange={(e) => setTokenInput(e.target.value)}
-                  placeholder={tokenType === 'adc_json' ? '{"type":"authorized_user","client_id":"...","refresh_token":"..."}' : 'ya29.xxx...'}
-                  rows={tokenType === 'adc_json' ? 3 : 1}
-                  className="w-full px-3 py-2 text-xs font-mono border border-slate-300 rounded-md bg-white focus:ring-2 focus:ring-blue-400 focus:outline-none"
-                />
-              </div>
-              <button
-                onClick={handleTokenSubmit}
-                disabled={loadingAuth || !tokenInput.trim()}
-                className="px-4 py-2 text-xs font-medium bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50 transition-colors flex-shrink-0"
-              >
-                {loadingAuth ? 'Authenticating...' : 'Authenticate'}
-              </button>
-            </div>
+            )}
           </div>
+          {gcpRefreshToken && (
+            <button
+              onClick={() => { setGcpRefreshToken(''); handleLogout() }}
+              className="text-xs text-red-500 hover:text-red-700 underline flex-shrink-0"
+            >
+              Clear
+            </button>
+          )}
+        </div>
+        {gcpTokenUser && (
+          <p className="mt-1.5 text-xs text-green-700">
+            Authenticated as <span className="font-medium">{gcpTokenUser}</span> — token will auto-refresh before each run
+          </p>
+        )}
+        {gcpTokenError && (
+          <p className="mt-1.5 text-xs text-red-600">{gcpTokenError}</p>
         )}
       </div>
 
@@ -1136,10 +1177,10 @@ export default function DataprocTab() {
                 </FormField>
               )}
               <ActionButton
-                label={e2eRunning ? 'Running...' : 'Run Full Pipeline'}
+                label={e2eRunning ? 'Running...' : !gcpTokenUser ? 'Provide GCP Token' : 'Run Full Pipeline'}
                 onClick={handleRunE2E}
                 loading={e2eRunning}
-                disabled={e2eRunning}
+                disabled={e2eRunning || !gcpTokenUser}
                 variant="secondary"
               />
               {e2eRunning && e2eRunId && e2eRunId !== 'pending' && (
@@ -1556,10 +1597,10 @@ export default function DataprocTab() {
               <span className="font-semibold">3-Step Pipeline:</span> Batch Load &rarr; Incremental Batch 2 &rarr; Incremental Batch 3
             </div>
             <ActionButton
-              label={manualPipelineRunning ? 'Running...' : 'Run Pipeline'}
+              label={manualPipelineRunning ? 'Running...' : !gcpTokenUser ? 'Provide GCP Token' : 'Run Pipeline'}
               onClick={handleManualPipeline}
               loading={manualPipelineRunning}
-              disabled={manualPipelineRunning}
+              disabled={manualPipelineRunning || !gcpTokenUser}
             />
             {manualPipelineRunning && manualRunId && manualRunId !== 'pending' && (
               <button

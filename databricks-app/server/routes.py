@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from databricks.sdk import WorkspaceClient
-from server.config import get_workspace_client, get_user_email
+from server.config import get_workspace_client, get_workspace_client_with_token, get_user_email
 from server import run_history
 
 router = APIRouter()
@@ -177,10 +177,12 @@ class JobCreateRequest(BaseModel):
     photon: bool = True
     log_detailed_stats: bool = True
     job_id: Optional[int] = None
+    admin_token: str = ""  # PAT token — job runs as this user
 
 
 class RunJobRequest(BaseModel):
     job_id: int
+    admin_token: str = ""  # PAT token — job runs as this user
 
 
 class PrerequisitesRequest(BaseModel):
@@ -476,71 +478,93 @@ async def verify_prerequisites(req: PrerequisitesRequest, request: Request):
                 steps.append({"step": "external_location", "name": ext_loc_name, "status": "created", "url": ext_loc_url, "credential": cred_to_use})
             except Exception as e:
                 error_msg = str(e)
-                sa_email = ""
-                gcs_bucket = ""
-                # Try to get the SA email and build actionable fix instructions
-                try:
-                    gcs_parts = req.raw_data_path.replace("gs://", "").split("/")
-                    gcs_bucket = gcs_parts[0]
-                except Exception:
-                    pass
-                # Try multiple ways to get the SA email
-                try:
-                    sc = w.storage_credentials.get(req.catalog_name)
-                    if hasattr(sc, 'databricks_gcp_service_account') and sc.databricks_gcp_service_account:
-                        sa_email = sc.databricks_gcp_service_account.email or ""
-                except Exception:
-                    pass
-                if not sa_email:
-                    # Try raw API to list storage credentials
+                # If ALREADY_EXISTS, the ext location is there — we just can't read it.
+                # Mark as exists so the grant step fires.
+                if "ALREADY_EXISTS" in error_msg.upper():
+                    ext_loc_exists = True
+                    ext_loc_url = f"gs://{req.raw_data_path.replace('gs://', '').split('/')[0]}"
+                    steps.append({"step": "external_location", "name": ext_loc_name, "status": "exists", "note": "Already exists (created by prior run)"})
+                else:
+                    sa_email = ""
+                    gcs_bucket = ""
                     try:
-                        resp = w.api_client.do("GET", "/api/2.1/unity-catalog/storage-credentials")
-                        for sc_item in (resp or {}).get("storage_credentials", []):
-                            if sc_item.get("name") == req.catalog_name:
-                                gcp_sa = sc_item.get("databricks_gcp_service_account", {})
-                                sa_email = gcp_sa.get("email", "")
-                                break
+                        gcs_parts = req.raw_data_path.replace("gs://", "").split("/")
+                        gcs_bucket = gcs_parts[0]
                     except Exception:
                         pass
-                fix_steps = []
-                if "CREATE EXTERNAL LOCATION" in error_msg.upper() or "CREATE_EXTERNAL_LOCATION" in error_msg.upper():
-                    fix_steps.append(
-                        "1) Grant SP metastore permission: Go to Catalog > gear icon > Permissions > "
-                        "Grant 'CREATE EXTERNAL LOCATION' to the app's service principal"
-                    )
-                if sa_email and gcs_bucket:
-                    fix_steps.append(
-                        f"2) Grant GCS access: gsutil iam ch "
-                        f"serviceAccount:{sa_email}:roles/storage.admin "
-                        f"gs://{gcs_bucket}"
-                    )
-                elif sa_email:
-                    fix_steps.append(f"2) Grant SA '{sa_email}' access to the GCS bucket")
-                if fix_steps:
-                    error_msg += ". FIX: " + " | ".join(fix_steps)
-                # External location creation failed — but if raw data path is accessible
-                # via an existing location or direct GCS access, this is non-blocking
-                steps.append({
-                    "step": "external_location", "name": ext_loc_name,
-                    "status": "info", "note": f"Could not create (non-blocking if data is already accessible): {error_msg}",
-                    **({"sa_email": sa_email} if sa_email else {}),
-                    **({"gcs_bucket": gcs_bucket} if gcs_bucket else {}),
-                })
-
-        # 3a. Grant SP READ_FILES and WRITE_FILES on the external location
-        if ext_loc_exists:
-            try:
-                sp_client_id = os.environ.get("DATABRICKS_CLIENT_ID", "")
-                if sp_client_id:
-                    _admin_api("PATCH", f"/api/2.1/unity-catalog/permissions/external_location/{ext_loc_name}", {
-                        "changes": [{
-                            "principal": sp_client_id,
-                            "add": ["READ_FILES", "WRITE_FILES"],
-                        }],
+                    try:
+                        sc = w.storage_credentials.get(req.catalog_name)
+                        if hasattr(sc, 'databricks_gcp_service_account') and sc.databricks_gcp_service_account:
+                            sa_email = sc.databricks_gcp_service_account.email or ""
+                    except Exception:
+                        pass
+                    if not sa_email:
+                        try:
+                            resp = w.api_client.do("GET", "/api/2.1/unity-catalog/storage-credentials")
+                            for sc_item in (resp or {}).get("storage_credentials", []):
+                                if sc_item.get("name") == req.catalog_name:
+                                    gcp_sa = sc_item.get("databricks_gcp_service_account", {})
+                                    sa_email = gcp_sa.get("email", "")
+                                    break
+                        except Exception:
+                            pass
+                    fix_steps = []
+                    if "CREATE EXTERNAL LOCATION" in error_msg.upper() or "CREATE_EXTERNAL_LOCATION" in error_msg.upper():
+                        fix_steps.append(
+                            "1) Grant SP metastore permission: Go to Catalog > gear icon > Permissions > "
+                            "Grant 'CREATE EXTERNAL LOCATION' to the app's service principal"
+                        )
+                    if sa_email and gcs_bucket:
+                        fix_steps.append(
+                            f"2) Grant GCS access: gsutil iam ch "
+                            f"serviceAccount:{sa_email}:roles/storage.admin "
+                            f"gs://{gcs_bucket}"
+                        )
+                    elif sa_email:
+                        fix_steps.append(f"2) Grant SA '{sa_email}' access to the GCS bucket")
+                    if fix_steps:
+                        error_msg += ". FIX: " + " | ".join(fix_steps)
+                    steps.append({
+                        "step": "external_location", "name": ext_loc_name,
+                        "status": "info", "note": f"Could not create (non-blocking if data is already accessible): {error_msg}",
+                        **({"sa_email": sa_email} if sa_email else {}),
+                        **({"gcs_bucket": gcs_bucket} if gcs_bucket else {}),
                     })
-                    steps.append({"step": "sp_ext_loc_grant", "name": ext_loc_name, "status": "created"})
-            except Exception as e:
-                steps.append({"step": "sp_ext_loc_grant", "name": ext_loc_name, "status": "skipped", "error": str(e)})
+
+        # 3a. Grant READ_FILES and WRITE_FILES on the external location
+        # The SP may own the ext location, so use SP client (w) to grant.
+        # Grant to both the SP client ID and the PAT user.
+        if ext_loc_exists:
+            grant_principals = []
+            sp_client_id = os.environ.get("DATABRICKS_CLIENT_ID", "")
+            if sp_client_id:
+                grant_principals.append(sp_client_id)
+            # Also grant to the admin token user (PAT user who will run jobs)
+            if admin_token:
+                try:
+                    pat_w = get_workspace_client_with_token(admin_token)
+                    pat_me = pat_w.current_user.me()
+                    pat_user = pat_me.user_name or ""
+                    if pat_user and pat_user not in grant_principals:
+                        grant_principals.append(pat_user)
+                except Exception:
+                    pass
+            for principal in grant_principals:
+                try:
+                    # Use SP client (w) since SP owns the ext location
+                    w.api_client.do(
+                        "PATCH",
+                        f"/api/2.1/unity-catalog/permissions/external_location/{ext_loc_name}",
+                        body={
+                            "changes": [{
+                                "principal": principal,
+                                "add": ["READ_FILES", "WRITE_FILES"],
+                            }],
+                        },
+                    )
+                    steps.append({"step": "ext_loc_grant", "name": f"{ext_loc_name} → {principal}", "status": "created"})
+                except Exception as e:
+                    steps.append({"step": "ext_loc_grant", "name": f"{ext_loc_name} → {principal}", "status": "skipped", "error": str(e)})
 
         # 3b. Schema
         schema_full = f"{req.catalog_name}.{req.schema_name}"
@@ -1029,7 +1053,7 @@ async def create_datagen_job(req: DataGenJobRequest, request: Request):
 @router.post("/databricks/create-job")
 async def create_job(req: JobCreateRequest, request: Request):
     try:
-        w = get_workspace_client(request)
+        w = get_workspace_client_with_token(req.admin_token) if req.admin_token else get_workspace_client(request)
 
         jar_path = req.jar_path
         if not jar_path:
@@ -1115,7 +1139,7 @@ async def create_job(req: JobCreateRequest, request: Request):
 @router.post("/databricks/run-job")
 async def run_job(req: RunJobRequest, request: Request):
     try:
-        w = get_workspace_client(request)
+        w = get_workspace_client_with_token(req.admin_token) if req.admin_token else get_workspace_client(request)
         wait = w.jobs.run_now(job_id=req.job_id)
         run_id = wait.run_id
         # Build run_page_url from workspace host
@@ -1130,9 +1154,9 @@ async def run_job(req: RunJobRequest, request: Request):
 # ── Job Status ──────────────────────────────────────────────────────────────
 
 @router.get("/databricks/job-status/{run_id}")
-async def get_job_status(run_id: int, request: Request):
+async def get_job_status(run_id: int, request: Request, admin_token: str = Query("")):
     try:
-        w = get_workspace_client(request)
+        w = get_workspace_client_with_token(admin_token) if admin_token else get_workspace_client(request)
         run = w.jobs.get_run(run_id=run_id)
 
         state = run.state
@@ -1455,6 +1479,53 @@ async def list_run_history(request: Request, limit: int = Query(50)):
 @router.delete("/databricks/run-history/{filename}")
 async def delete_run_history(filename: str, request: Request):
     return run_history.delete_run(request, filename)
+
+
+class ResolveTokenRequest(BaseModel):
+    token: str
+
+
+@router.post("/databricks/resolve-token")
+async def resolve_token(req: ResolveTokenRequest, request: Request):
+    """Resolve a PAT token to user info by calling SCIM Me endpoint."""
+    try:
+        w = get_workspace_client_with_token(req.token)
+        me = w.current_user.me()
+        return {
+            "status": "ok",
+            "user_name": me.user_name or "",
+            "display_name": me.display_name or "",
+            "id": str(me.id) if me.id else "",
+        }
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
+
+
+class GrantExtLocationRequest(BaseModel):
+    ext_location_name: str
+    principal: str  # user email or SP client ID to grant to
+    privileges: list = ["READ_FILES", "WRITE_FILES"]
+
+
+@router.post("/databricks/grant-ext-location")
+async def grant_ext_location(req: GrantExtLocationRequest, request: Request):
+    """Grant privileges on an external location using SP credentials (SP is owner)."""
+    try:
+        w = get_workspace_client(request)  # SP client - owns the ext location
+        result = w.api_client.do(
+            "PATCH",
+            f"/api/2.1/unity-catalog/permissions/external_location/{req.ext_location_name}",
+            body={
+                "changes": [{
+                    "principal": req.principal,
+                    "add": req.privileges,
+                }],
+            },
+        )
+        return {"status": "granted", "principal": req.principal, "privileges": req.privileges}
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/health")

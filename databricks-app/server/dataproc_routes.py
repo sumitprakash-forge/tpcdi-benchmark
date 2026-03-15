@@ -120,6 +120,7 @@ class DataprocPrereqRequest(BaseModel):
     metastore_mode: str = "spark_default"  # "spark_default", "create", "existing"
     metastore_name: str = "tpcdi-benchmark-metastore"
     metastore_path: str = ""  # Full path for existing metastore
+    gcp_refresh_token: str = ""  # Auto-refresh: re-auth before prereq check
 
 
 class DataprocFullRunRequest(BaseModel):
@@ -141,6 +142,7 @@ class DataprocFullRunRequest(BaseModel):
     raw_data_path: str = "gs://sumit_prakash_gcs/tpcdi"
     target_database: str = "tpcdi_warehouse"
     metrics_output: str = "gs://sumit_prakash_gcs/tpcdi/metrics"
+    gcp_refresh_token: str = ""  # Auto-refresh: re-auth before each run
 
 
 # ── Active runs tracker ──────────────────────────────────────────────────
@@ -224,6 +226,12 @@ async def verify_prerequisites(req: DataprocPrereqRequest):
       4. cloud_nat         – Cloud Router + NAT so internal_ip_only nodes can reach the internet
       5. gcs_bucket        – verify req.gcs_bucket is accessible
     """
+    # Auto-refresh: if a refresh token is provided, re-authenticate to ensure fresh creds
+    if req.gcp_refresh_token:
+        auth_result = set_refresh_token(req.gcp_refresh_token)
+        if auth_result.get("status") != "authenticated":
+            raise HTTPException(status_code=401, detail=f"Failed to refresh GCP token: {auth_result.get('message', 'Unknown error')}")
+
     creds = get_credentials()
     if not creds:
         raise HTTPException(status_code=401, detail="Not authenticated with Google Cloud. Please sign in first.")
@@ -655,7 +663,13 @@ async def run_full_cycle(req: DataprocFullRunRequest):
     """Start full Dataproc cycle: create cluster → submit job → wait → delete cluster.
     Returns run_id for polling.
     """
-    # Verify auth first
+    # Auto-refresh: if a refresh token is provided, re-authenticate to ensure fresh creds
+    if req.gcp_refresh_token:
+        auth_result = set_refresh_token(req.gcp_refresh_token)
+        if auth_result.get("status") != "authenticated":
+            raise HTTPException(status_code=401, detail=f"Failed to refresh GCP token: {auth_result.get('message', 'Unknown error')}")
+
+    # Verify auth
     creds = get_credentials()
     if not creds:
         raise HTTPException(status_code=401, detail="Not authenticated with Google Cloud. Please sign in first.")

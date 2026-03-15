@@ -247,6 +247,9 @@ export default function DatabricksTab() {
   const [loadingPrereqCreate, setLoadingPrereqCreate] = useState(false)
   const [fixingGcsIam, setFixingGcsIam] = useState(false)
   const [adminToken, setAdminToken] = useState('')
+  const [tokenUser, setTokenUser] = useState<{ user_name: string; display_name: string } | null>(null)
+  const [resolvingToken, setResolvingToken] = useState(false)
+  const [tokenError, setTokenError] = useState<string | null>(null)
 
   // Benchmark config state
   const [loadType, _setLoadType] = useState('batch')
@@ -349,6 +352,7 @@ export default function DatabricksTab() {
   const [e2eActiveStep, setE2eActiveStep] = useState<number | null>(savedE2E.current?.activeStep || null)
   const [runCosts, setRunCosts] = useState<(RunCost | null)[]>(savedE2E.current?.costs || [null, null, null])
   const [e2eRemainingSpecs, setE2eRemainingSpecs] = useState<E2ERunSpec[]>(savedE2E.current?.remainingSpecs || [])
+  const [e2eSaveNeeded, setE2eSaveNeeded] = useState(false)
   const benchmarkNotebookPath = useRef<string>('')
 
   // Manual pipeline state - restore from localStorage
@@ -366,6 +370,7 @@ export default function DatabricksTab() {
   const [manualRemainingSpecs, setManualRemainingSpecs] = useState<ManualPipelineSpec[]>(savedManual.current?.remainingSpecs || [])
   const manualCancelledRef = useRef(false)
   const manualStartingRef = useRef(false)
+  const [manualSaveNeeded, setManualSaveNeeded] = useState(false)
 
   // Persist jobId to localStorage
   useEffect(() => {
@@ -389,6 +394,58 @@ export default function DatabricksTab() {
     }
     localStorage.setItem(E2E_STATE_KEY, JSON.stringify(state))
   }, [e2eSteps, e2eSF, e2eRunId, e2eActiveStep, e2eRunning, runCosts, e2eRemainingSpecs])
+
+  // Auto-save E2E run history when pipeline completes (uses fresh state, no stale closure)
+  useEffect(() => {
+    if (!e2eSaveNeeded) return
+    setE2eSaveNeeded(false)
+    const hasSuccess = e2eSteps.some(s => s.status === 'success')
+    if (!hasSuccess) return
+    fetch('/api/databricks/save-run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        run_data: {
+          platform: 'databricks',
+          mode: 'e2e',
+          flow_type: 'e2e',
+          scale_factor: e2eSF,
+          steps: e2eSteps,
+          costs: runCosts,
+          completed_at: new Date().toISOString(),
+          status: e2eSteps.every(s => s.status === 'success') ? 'completed' : 'failed',
+          run_by: tokenUser?.display_name || tokenUser?.user_name || 'unknown',
+          run_by_email: tokenUser?.user_name || '',
+        }
+      })
+    }).catch(() => {})
+  }, [e2eSaveNeeded, e2eSteps, e2eSF, runCosts, tokenUser])
+
+  // Auto-save manual pipeline run history when complete (uses fresh state)
+  useEffect(() => {
+    if (!manualSaveNeeded) return
+    setManualSaveNeeded(false)
+    const hasSuccess = manualSteps.some(s => s.status === 'success')
+    if (!hasSuccess) return
+    fetch('/api/databricks/save-run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        run_data: {
+          platform: 'databricks',
+          mode: 'manual',
+          flow_type: 'manual',
+          scale_factor: scaleFactor,
+          steps: manualSteps,
+          costs: manualCosts,
+          completed_at: new Date().toISOString(),
+          status: manualSteps.every(s => s.status === 'success') ? 'completed' : 'failed',
+          run_by: tokenUser?.display_name || tokenUser?.user_name || 'unknown',
+          run_by_email: tokenUser?.user_name || '',
+        }
+      })
+    }).catch(() => {})
+  }, [manualSaveNeeded, manualSteps, scaleFactor, manualCosts, tokenUser])
 
   // Persist manual pipeline state to localStorage
   useEffect(() => {
@@ -428,6 +485,36 @@ export default function DatabricksTab() {
     }
     return res.json()
   }
+
+  // Resolve PAT token to user info
+  const resolveToken = useCallback(async (token: string) => {
+    if (!token || token.length < 10) {
+      setTokenUser(null)
+      setTokenError(null)
+      return
+    }
+    setResolvingToken(true)
+    setTokenError(null)
+    try {
+      const data = await apiCall('/api/databricks/resolve-token', {
+        method: 'POST',
+        body: JSON.stringify({ token }),
+      })
+      setTokenUser({ user_name: data.user_name, display_name: data.display_name })
+    } catch (e: any) {
+      setTokenUser(null)
+      setTokenError(e.message || 'Invalid token')
+    } finally {
+      setResolvingToken(false)
+    }
+  }, [])
+
+  // Debounced token resolution
+  useEffect(() => {
+    if (!adminToken) { setTokenUser(null); setTokenError(null); return }
+    const timer = setTimeout(() => resolveToken(adminToken), 500)
+    return () => clearTimeout(timer)
+  }, [adminToken, resolveToken])
 
   // Sync targetCatalog with catalogName
   useEffect(() => {
@@ -599,6 +686,7 @@ export default function DatabricksTab() {
           photon: true,
           local_ssds: sizing.ssds,
           log_detailed_stats: true,
+          admin_token: adminToken,
         }),
       })
       createdJobId = jobResult.job_id
@@ -614,7 +702,7 @@ export default function DatabricksTab() {
     try {
       const runResult = await apiCall('/api/databricks/run-job', {
         method: 'POST',
-        body: JSON.stringify({ job_id: createdJobId }),
+        body: JSON.stringify({ job_id: createdJobId, admin_token: adminToken }),
       })
       setE2eRunId(runResult.run_id)
       updateE2EStep(stepIndex, {
@@ -641,7 +729,8 @@ export default function DatabricksTab() {
 
     const poll = async () => {
       try {
-        const status = await apiCall(`/api/databricks/job-status/${e2eRunId}`)
+        const tokenParam = adminToken ? `&admin_token=${encodeURIComponent(adminToken)}` : ''
+        const status = await apiCall(`/api/databricks/job-status/${e2eRunId}?_=1${tokenParam}`)
         const stateStr = status.result_state
           ? `${status.state} (${status.result_state})`
           : status.state
@@ -686,23 +775,10 @@ export default function DatabricksTab() {
                 return []
               }
               if (prev.length === 0) {
-                // Pipeline complete — save and stop
+                // Pipeline complete — save via useEffect (avoids stale closure)
                 setE2eRunning(false)
                 setE2eActiveStep(null)
-                fetch('/api/databricks/save-run', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({
-                    run_data: {
-                      platform: 'databricks',
-                      mode: 'e2e',
-                      scale_factor: e2eSF,
-                      steps: e2eSteps,
-                      costs: runCosts,
-                      completed_at: new Date().toISOString(),
-                    }
-                  })
-                }).catch(() => {})
+                setE2eSaveNeeded(true)
                 return prev
               }
               const [next, ...rest] = prev
@@ -737,6 +813,10 @@ export default function DatabricksTab() {
 
   // Main E2E handler: prereqs then queue all run specs
   async function handleRunE2E() {
+    if (!adminToken || !tokenUser) {
+      addToast('PAT token is required. Enter a valid Databricks PAT token to run jobs.', 'error')
+      return
+    }
     const steps = buildE2ESteps(e2eSF)
     setE2eSteps(steps)
     setE2eRunning(true)
@@ -873,6 +953,7 @@ export default function DatabricksTab() {
           photon,
           local_ssds: localSsds,
           log_detailed_stats: logDetailedStats,
+          admin_token: adminToken,
         }),
       })
       createdJobId = jobResult.job_id
@@ -888,7 +969,7 @@ export default function DatabricksTab() {
     try {
       const runResult = await apiCall('/api/databricks/run-job', {
         method: 'POST',
-        body: JSON.stringify({ job_id: createdJobId }),
+        body: JSON.stringify({ job_id: createdJobId, admin_token: adminToken }),
       })
       setManualRunId(runResult.run_id)
       updateManualStep(stepIndex, {
@@ -911,7 +992,8 @@ export default function DatabricksTab() {
 
     const poll = async () => {
       try {
-        const status = await apiCall(`/api/databricks/job-status/${manualRunId}`)
+        const mTokenParam = adminToken ? `&admin_token=${encodeURIComponent(adminToken)}` : ''
+        const status = await apiCall(`/api/databricks/job-status/${manualRunId}?_=1${mTokenParam}`)
         const stateStr = status.result_state
           ? `${status.state} (${status.result_state})`
           : status.state
@@ -972,6 +1054,7 @@ export default function DatabricksTab() {
     if (manualRemainingSpecs.length === 0) {
       setManualRunning(false)
       setManualActiveStep(null)
+      setManualSaveNeeded(true)
       return
     }
     if (manualStartingRef.current) return
@@ -981,6 +1064,10 @@ export default function DatabricksTab() {
   }, [manualRunId, manualRunning, manualRemainingSpecs])
 
   async function handleManualPipeline() {
+    if (!adminToken || !tokenUser) {
+      addToast('PAT token is required. Enter a valid Databricks PAT token to run jobs.', 'error')
+      return
+    }
     const steps = buildManualPipelineSteps(scaleFactor)
     setManualSteps(steps)
     setManualRunning(true)
@@ -1128,22 +1215,39 @@ export default function DatabricksTab() {
               <FormField label="Raw Data Path">
                 <div className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-md text-sm font-mono text-slate-700 max-w-[260px] truncate" title={rawDataPath}>{rawDataPath}</div>
               </FormField>
-              <FormField label="Admin PAT Token (optional)">
+              <FormField label="Databricks PAT Token (required)">
                 <input
                   type="password"
-                  className="px-3 py-2 bg-white border border-slate-200 rounded-md text-sm font-mono text-slate-700"
+                  className={`px-3 py-2 bg-white border rounded-md text-sm font-mono text-slate-700 ${tokenError ? 'border-red-300' : tokenUser ? 'border-green-300' : 'border-slate-200'}`}
                   value={adminToken}
                   onChange={e => setAdminToken(e.target.value)}
                   placeholder="dapi..."
-                  title="Workspace admin PAT token for granting SP permissions. Only needed on first run."
+                  title="Databricks PAT token — jobs run as this user"
                 />
-                <p className="text-xs text-slate-400 mt-1">Needed once to grant SP permissions (cluster-create, catalog, metastore)</p>
+                {resolvingToken && (
+                  <p className="text-xs text-blue-500 mt-1">Resolving token...</p>
+                )}
+                {tokenUser && (
+                  <p className="text-xs text-green-600 mt-1 flex items-center gap-1">
+                    <span className="w-2 h-2 rounded-full bg-green-400 inline-block" />
+                    Running as: <span className="font-medium">{tokenUser.display_name || tokenUser.user_name}</span>
+                    {tokenUser.display_name && tokenUser.user_name && tokenUser.display_name !== tokenUser.user_name && (
+                      <span className="text-slate-400">({tokenUser.user_name})</span>
+                    )}
+                  </p>
+                )}
+                {tokenError && (
+                  <p className="text-xs text-red-500 mt-1">{tokenError}</p>
+                )}
+                {!adminToken && (
+                  <p className="text-xs text-slate-400 mt-1">Jobs will run as this user. All permissions use this identity.</p>
+                )}
               </FormField>
               <ActionButton
                 label={e2eRunning ? 'Running...' : 'Run Full Pipeline'}
                 onClick={handleRunE2E}
                 loading={e2eRunning}
-                disabled={e2eRunning}
+                disabled={e2eRunning || !adminToken || !tokenUser}
               />
               {e2eRunning && e2eRunId && (
                 <button
