@@ -3,6 +3,7 @@ import Section from './Section'
 import ActionButton from './ActionButton'
 import FormField, { TextInput, NumberInput, SelectInput } from './FormField'
 import Toast from './Toast'
+import RunHistorySection from './RunHistorySection'
 
 interface ToastMessage {
   id: number
@@ -1762,6 +1763,9 @@ export default function DataprocTab() {
       </Section>
       </>
       )}
+
+      {/* Run History */}
+      <RunHistorySection platform="dataproc" />
     </div>
   )
 }

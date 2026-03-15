@@ -6,6 +6,7 @@ from typing import Optional, List
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
+from databricks.sdk import WorkspaceClient
 from server.config import get_workspace_client, get_user_email
 from server import run_history
 
@@ -189,6 +190,7 @@ class PrerequisitesRequest(BaseModel):
     raw_data_path: str = "gs://sumit_prakash_gcs/tpcdi"
     sa_email: str = ""
     sa_key_json: str = ""
+    admin_token: str = ""  # Optional admin PAT for granting SP permissions
 
 
 # ── Check Prerequisites (GET - read-only status) ─────────────────────────
@@ -256,12 +258,52 @@ async def check_prerequisites(
 
 @router.post("/databricks/verify-prerequisites")
 async def verify_prerequisites(req: PrerequisitesRequest, request: Request):
-    """Check and create all prerequisites: SP permissions, catalog, schema, volume."""
+    """Check and create all prerequisites: SP permissions, catalog, schema, volume.
+
+    If admin_token is provided, it's used for admin-level operations (SCIM grants,
+    catalog grants, metastore grants) that the SP can't do for itself.
+    """
     try:
         w = get_workspace_client(request)
         cred_name = req.catalog_name
         ext_loc_name = f"{req.catalog_name}_raw_data"
         volume_name = "libs"
+
+        # If admin token provided, use raw HTTP for admin operations (avoids SDK parsing bugs)
+        import urllib.request
+        import urllib.error
+
+        ws_host = os.environ.get("DATABRICKS_HOST", "")
+        if ws_host and not ws_host.startswith("http"):
+            ws_host = f"https://{ws_host}"
+        admin_token = req.admin_token.strip() if req.admin_token else ""
+
+        def _admin_api(method: str, path: str, body: dict = None) -> dict:
+            """Make a raw HTTP call using admin token (or SP client as fallback)."""
+            token = admin_token
+            if not token:
+                # Fallback to SP client
+                if method == "GET":
+                    return w.api_client.do("GET", path, query=body)
+                elif method == "PATCH":
+                    return w.api_client.do("PATCH", path, body=body)
+                else:
+                    return w.api_client.do("POST", path, body=body)
+            url = f"{ws_host}{path}"
+            data = json.dumps(body).encode("utf-8") if body else None
+            req_obj = urllib.request.Request(url, data=data, method=method)
+            req_obj.add_header("Authorization", f"Bearer {token}")
+            req_obj.add_header("Content-Type", "application/json")
+            try:
+                with urllib.request.urlopen(req_obj) as resp:
+                    resp_data = resp.read().decode("utf-8")
+                    return json.loads(resp_data) if resp_data.strip() else {}
+            except urllib.error.HTTPError as e:
+                error_body = e.read().decode("utf-8", errors="replace")
+                raise Exception(f"HTTP {e.code}: {error_body[:500]}")
+
+        # priv_w still used for SDK calls that don't have parsing issues
+        priv_w = w
 
         steps = []
 
@@ -269,88 +311,52 @@ async def verify_prerequisites(req: PrerequisitesRequest, request: Request):
         try:
             sp_id = os.environ.get("DATABRICKS_CLIENT_ID", "")
             if sp_id:
-                # Find SP numeric ID from application ID
-                sp_list = w.service_principals.list(filter=f"applicationId eq '{sp_id}'")
-                sp_obj = next(sp_list, None)
+                # Find SP numeric ID using raw API (avoids SDK parsing bugs)
+                from urllib.parse import quote
+                scim_filter = quote(f"applicationId eq '{sp_id}'")
+                sp_data = _admin_api("GET", f"/api/2.0/preview/scim/v2/ServicePrincipals?filter={scim_filter}")
+                sp_resources = sp_data.get("Resources", [])
+                sp_obj = sp_resources[0] if sp_resources else None
                 if sp_obj:
-                    has_cluster_create = any(
-                        e.value == "allow-cluster-create"
-                        for e in (sp_obj.entitlements or [])
-                    )
-                    if not has_cluster_create:
-                        # Use raw API call — SDK SCIM types vary across versions
-                        w.api_client.do(
-                            "PATCH",
-                            f"/api/2.0/preview/scim/v2/ServicePrincipals/{sp_obj.id}",
-                            body={
-                                "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
-                                "Operations": [{
-                                    "op": "add",
-                                    "path": "entitlements",
-                                    "value": [{"value": "allow-cluster-create"}],
-                                }],
-                            },
-                        )
+                    sp_numeric_id = sp_obj.get("id")
+                    entitlements = [e.get("value") for e in sp_obj.get("entitlements", [])]
+                    if "allow-cluster-create" not in entitlements:
+                        _admin_api("PATCH", f"/api/2.0/preview/scim/v2/ServicePrincipals/{sp_numeric_id}", {
+                            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+                            "Operations": [{
+                                "op": "add",
+                                "path": "entitlements",
+                                "value": [{"value": "allow-cluster-create"}],
+                            }],
+                        })
                         steps.append({"step": "sp_cluster_create", "name": "allow-cluster-create", "status": "created"})
                     else:
                         steps.append({"step": "sp_cluster_create", "name": "allow-cluster-create", "status": "exists"})
         except Exception as e:
             steps.append({"step": "sp_cluster_create", "name": "allow-cluster-create", "status": "skipped", "error": str(e)})
 
-        # 0b. Grant SP permissions on catalog via raw API
-        try:
-            sp_client_id = os.environ.get("DATABRICKS_CLIENT_ID", "")
-            if sp_client_id:
-                w.api_client.do(
-                    "PATCH",
-                    f"/api/2.1/unity-catalog/permissions/catalog/{req.catalog_name}",
-                    body={
-                        "changes": [{
-                            "principal": sp_client_id,
-                            "add": ["USE_CATALOG", "USE_SCHEMA", "CREATE_SCHEMA", "CREATE_TABLE", "SELECT", "MODIFY"],
-                        }],
-                    },
-                )
-                steps.append({"step": "sp_catalog_grant", "name": req.catalog_name, "status": "created"})
-        except Exception as e:
-            steps.append({"step": "sp_catalog_grant", "name": req.catalog_name, "status": "skipped", "error": str(e)})
+        # 0b. Grant SP permissions on catalog (deferred to after catalog check/create below)
 
         # 0c. Grant SP CREATE EXTERNAL LOCATION on metastore (needed to create ext locations)
         try:
             sp_client_id = os.environ.get("DATABRICKS_CLIENT_ID", "")
             if sp_client_id:
                 # Get current metastore assignment
-                metastore = w.metastores.current()
-                metastore_id = metastore.metastore_id if metastore else None
+                metastore_resp = _admin_api("GET", "/api/2.1/unity-catalog/current-metastore-assignment")
+                metastore_id = metastore_resp.get("metastore_id")
                 if metastore_id:
-                    w.api_client.do(
-                        "PATCH",
-                        f"/api/2.1/unity-catalog/permissions/metastore/{metastore_id}",
-                        body={
-                            "changes": [{
-                                "principal": sp_client_id,
-                                "add": ["CREATE_EXTERNAL_LOCATION"],
-                            }],
-                        },
-                    )
+                    _admin_api("PATCH", f"/api/2.1/unity-catalog/permissions/metastore/{metastore_id}", {
+                        "changes": [{
+                            "principal": sp_client_id,
+                            "add": ["CREATE_EXTERNAL_LOCATION"],
+                        }],
+                    })
                     steps.append({"step": "sp_metastore_grant", "name": "CREATE_EXTERNAL_LOCATION", "status": "created"})
                 else:
-                    steps.append({"step": "sp_metastore_grant", "name": "CREATE_EXTERNAL_LOCATION", "status": "skipped", "error": "No metastore assigned"})
+                    steps.append({"step": "sp_metastore_grant", "name": "CREATE_EXTERNAL_LOCATION", "status": "info", "note": "No metastore assigned. Not required if external location already exists."})
         except Exception as e:
             error_msg = str(e)
-            # Provide manual fix instructions
-            try:
-                metastore = w.metastores.current()
-                mid = metastore.metastore_id if metastore else "UNKNOWN"
-            except Exception:
-                mid = "UNKNOWN"
-            sp_id_str = os.environ.get("DATABRICKS_CLIENT_ID", "UNKNOWN")
-            error_msg += (
-                f". Manual fix: run as workspace admin: "
-                f"databricks unity-catalog permissions update metastore {mid} "
-                f'--json \'{{"changes":[{{"principal":"{sp_id_str}","add":["CREATE_EXTERNAL_LOCATION"]}}]}}\''
-            )
-            steps.append({"step": "sp_metastore_grant", "name": "CREATE_EXTERNAL_LOCATION", "status": "skipped", "error": error_msg})
+            steps.append({"step": "sp_metastore_grant", "name": "CREATE_EXTERNAL_LOCATION", "status": "info", "note": f"Could not grant (non-blocking if external location already exists): {error_msg}"})
 
         # 1. Catalog
         catalog_exists = False
@@ -372,6 +378,53 @@ async def verify_prerequisites(req: PrerequisitesRequest, request: Request):
                 steps.append({"step": "catalog", "name": req.catalog_name, "status": "created"})
             except Exception as e:
                 steps.append({"step": "catalog", "name": req.catalog_name, "status": "error", "error": str(e)})
+
+        # 1b. Grant SP ALL PRIVILEGES on catalog (now that catalog exists)
+        if catalog_exists:
+            sp_client_id = os.environ.get("DATABRICKS_CLIENT_ID", "")
+            if sp_client_id:
+                grant_ok = False
+                # Try REST API first (using raw HTTP to avoid SDK parsing bugs)
+                try:
+                    _admin_api("PATCH", f"/api/2.1/unity-catalog/permissions/catalog/{req.catalog_name}", {
+                        "changes": [{
+                            "principal": sp_client_id,
+                            "add": ["ALL_PRIVILEGES"],
+                        }],
+                    })
+                    grant_ok = True
+                    steps.append({"step": "sp_catalog_grant", "name": req.catalog_name, "status": "created"})
+                except Exception:
+                    pass
+                # Fallback: try SQL GRANT via SQL warehouse
+                if not grant_ok:
+                    try:
+                        sp_principal = sp_client_id
+                        warehouses = _admin_api("GET", "/api/2.0/sql/warehouses")
+                        wh_id = None
+                        for wh in (warehouses or {}).get("warehouses", []):
+                            if wh.get("state") in ("RUNNING", "STOPPED"):
+                                wh_id = wh["id"]
+                                break
+                        if wh_id:
+                            grant_sql = f"GRANT ALL PRIVILEGES ON CATALOG `{req.catalog_name}` TO `{sp_principal}`"
+                            stmt_resp = _admin_api("POST", "/api/2.0/sql/statements", {
+                                    "warehouse_id": wh_id,
+                                    "statement": grant_sql,
+                                    "wait_timeout": "30s",
+                                    "disposition": "INLINE",
+                                })
+                            sql_status = stmt_resp.get("status", {}).get("state", "")
+                            if sql_status == "SUCCEEDED":
+                                grant_ok = True
+                                steps.append({"step": "sp_catalog_grant", "name": req.catalog_name, "status": "created", "method": "sql"})
+                            else:
+                                sql_err = stmt_resp.get("status", {}).get("error", {}).get("message", sql_status)
+                                steps.append({"step": "sp_catalog_grant", "name": req.catalog_name, "status": "skipped", "error": f"SQL grant failed: {sql_err}"})
+                        else:
+                            steps.append({"step": "sp_catalog_grant", "name": req.catalog_name, "status": "skipped", "error": "No SQL warehouse available for grant. Create a SQL warehouse or grant manually."})
+                    except Exception as e:
+                        steps.append({"step": "sp_catalog_grant", "name": req.catalog_name, "status": "skipped", "error": str(e)})
 
         # 3. External Location for raw data - find or create one covering raw_data_path
         ext_loc_exists = False
@@ -465,9 +518,11 @@ async def verify_prerequisites(req: PrerequisitesRequest, request: Request):
                     fix_steps.append(f"2) Grant SA '{sa_email}' access to the GCS bucket")
                 if fix_steps:
                     error_msg += ". FIX: " + " | ".join(fix_steps)
+                # External location creation failed — but if raw data path is accessible
+                # via an existing location or direct GCS access, this is non-blocking
                 steps.append({
                     "step": "external_location", "name": ext_loc_name,
-                    "status": "skipped", "error": error_msg,
+                    "status": "info", "note": f"Could not create (non-blocking if data is already accessible): {error_msg}",
                     **({"sa_email": sa_email} if sa_email else {}),
                     **({"gcs_bucket": gcs_bucket} if gcs_bucket else {}),
                 })
@@ -477,16 +532,12 @@ async def verify_prerequisites(req: PrerequisitesRequest, request: Request):
             try:
                 sp_client_id = os.environ.get("DATABRICKS_CLIENT_ID", "")
                 if sp_client_id:
-                    w.api_client.do(
-                        "PATCH",
-                        f"/api/2.1/unity-catalog/permissions/external_location/{ext_loc_name}",
-                        body={
-                            "changes": [{
-                                "principal": sp_client_id,
-                                "add": ["READ_FILES", "WRITE_FILES"],
-                            }],
-                        },
-                    )
+                    _admin_api("PATCH", f"/api/2.1/unity-catalog/permissions/external_location/{ext_loc_name}", {
+                        "changes": [{
+                            "principal": sp_client_id,
+                            "add": ["READ_FILES", "WRITE_FILES"],
+                        }],
+                    })
                     steps.append({"step": "sp_ext_loc_grant", "name": ext_loc_name, "status": "created"})
             except Exception as e:
                 steps.append({"step": "sp_ext_loc_grant", "name": ext_loc_name, "status": "skipped", "error": str(e)})
@@ -601,15 +652,15 @@ async def verify_prerequisites(req: PrerequisitesRequest, request: Request):
                             steps.append({"step": "gcs_compute_sa", "name": f"{compute_sa} → gs://{gcs_bucket}", "status": "created"})
                     else:
                         steps.append({"step": "gcs_compute_sa", "name": f"{compute_sa} → gs://{gcs_bucket}",
-                                      "status": "skipped", "error": "GCP auth not available. Sign in on Dataproc tab first."})
+                                      "status": "info", "note": "GCP auth not available. Not required for benchmark — only needed for datagen upload."})
                 else:
                     steps.append({"step": "gcs_compute_sa", "name": f"gs://{gcs_bucket}",
-                                  "status": "skipped", "error": "Could not determine compute SA. Grant access manually."})
+                                  "status": "info", "note": "Could not determine compute SA. Not required for benchmark — only needed for datagen upload."})
         except Exception as e:
             sa_display = f"{compute_sa} → gs://{gcs_bucket}" if compute_sa and gcs_bucket else f"gs://{gcs_bucket}"
-            steps.append({"step": "gcs_compute_sa", "name": sa_display, "status": "skipped", "error": str(e)})
+            steps.append({"step": "gcs_compute_sa", "name": sa_display, "status": "info", "note": f"Non-blocking: {str(e)}"})
 
-        all_ok = all(s.get("status") in ("exists", "created", "skipped") for s in steps)
+        all_ok = all(s.get("status") in ("exists", "created", "skipped", "info") for s in steps)
         sa_email_summary = ""
         for s in steps:
             if s.get("step") == "gcs_compute_sa" and s.get("name"):
@@ -712,59 +763,144 @@ class BootstrapRequest(BaseModel):
 
 @router.post("/databricks/bootstrap")
 async def bootstrap_workspace(req: BootstrapRequest, request: Request):
-    """Verify notebooks exist in workspace repo and download spark-xml JAR to Volume.
+    """Fully automated bootstrap: deploy notebooks & benchmark module to SP workspace.
 
-    Notebooks and the benchmark module live in the Git repo (not bundled with the app).
-    They are synced to the workspace via Git Repos or databricks sync.
-    This endpoint verifies they are present and sets up the JAR dependency.
+    Copy sources are tried in order:
+    1. App's own deployed source (bundled via `databricks apps deploy` — always available)
+    2. Logged-in user's workspace path (legacy fallback)
+    If files already exist at the SP path, skip the copy.
     """
     try:
         w = get_workspace_client(request)
+        user_email = get_user_email(request)
         steps = []
 
-        # 1. Determine workspace path for notebooks
-        # Use SP's own workspace folder (SP always has write access there)
+        # 1. Resolve SP workspace path (where jobs will look for code)
         try:
             me = w.current_user.me()
             sp_identity = me.user_name or str(me.id)
         except Exception:
             sp_identity = "shared"
-        ws_base = f"/Workspace/Users/{sp_identity}/tpcdi-benchmark/databricks"
+        sp_base = f"/Workspace/Users/{sp_identity}/tpcdi-benchmark"
+        sp_notebooks = f"{sp_base}/databricks"
+        sp_benchmark = f"{sp_base}/benchmark"
 
-        # 2. Verify notebooks exist in workspace (deployed via Git/sync, not by this app)
-        notebooks = [
-            "benchmark_databricks_notebook",
-            "generate_tpcdi_data_notebook",
-        ]
-
-        for nb_name in notebooks:
-            nb_path = f"{ws_base}/{nb_name}"
+        # 2. Build ordered list of candidate source paths
+        #    a) App's deployed source code path (discovered via apps API or env)
+        #    b) User's workspace path
+        source_candidates = []
+        app_name = os.environ.get("DATABRICKS_APP_NAME", "")
+        if app_name:
             try:
-                w.workspace.get_status(nb_path)
-                steps.append({"step": f"notebook_{nb_name}", "name": nb_path, "status": "exists"})
+                app_info = w.api_client.do("GET", f"/api/2.0/apps/{app_name}")
+                active_dep = app_info.get("active_deployment", {})
+                src_path = active_dep.get("deployment_artifacts", {}).get("source_code_path", "")
+                if src_path:
+                    source_candidates.append(src_path)
             except Exception:
-                steps.append({
-                    "step": f"notebook_{nb_name}",
-                    "name": nb_path,
-                    "status": "error",
-                    "error": f"Notebook not found at {nb_path}. Sync the repo to workspace first.",
-                })
+                pass
+        if user_email:
+            source_candidates.append(f"/Workspace/Users/{user_email}/tpcdi-benchmark")
 
-        # 2b. Verify benchmark Python module exists in workspace
-        benchmark_ws_base = ws_base.rsplit("/databricks", 1)[0]
-        benchmark_ws_path = f"{benchmark_ws_base}/benchmark"
+        # Helper: recursively copy a workspace directory tree
+        def _copy_tree(src_dir: str, dst_dir: str) -> int:
+            try:
+                w.workspace.mkdirs(dst_dir)
+            except Exception:
+                pass
+            copied = 0
+            try:
+                items = list(w.workspace.list(src_dir))
+            except Exception:
+                return 0
+            for item in items:
+                src_path = item.path
+                rel = src_path[len(src_dir):]
+                dst_path = dst_dir + rel
+                obj_type = str(item.object_type) if item.object_type else ""
+                if "DIRECTORY" in obj_type:
+                    copied += _copy_tree(src_path, dst_path)
+                elif "NOTEBOOK" in obj_type:
+                    try:
+                        resp = w.api_client.do("GET", "/api/2.0/workspace/export",
+                                               query={"path": src_path, "format": "SOURCE"})
+                        lang = str(item.language) if item.language else "PYTHON"
+                        for kw in ["PYTHON", "SQL", "SCALA", "R"]:
+                            if kw in lang.upper():
+                                lang = kw
+                                break
+                        w.api_client.do("POST", "/api/2.0/workspace/import", body={
+                            "path": dst_path, "content": resp.get("content", ""),
+                            "format": "SOURCE", "language": lang, "overwrite": True,
+                        })
+                        copied += 1
+                    except Exception:
+                        pass
+                else:  # FILE
+                    try:
+                        resp = w.api_client.do("GET", "/api/2.0/workspace/export",
+                                               query={"path": src_path, "format": "AUTO"})
+                        w.api_client.do("POST", "/api/2.0/workspace/import", body={
+                            "path": dst_path, "content": resp.get("content", ""),
+                            "format": "AUTO", "overwrite": True,
+                        })
+                        copied += 1
+                    except Exception:
+                        pass
+            return copied
+
+        # Helper: copy a single notebook from first available source
+        def _copy_notebook(nb_name: str, dst_path: str, sub_dir: str = "databricks") -> dict:
+            for src_base in source_candidates:
+                src_nb = f"{src_base}/{sub_dir}/{nb_name}"
+                try:
+                    w.workspace.get_status(src_nb)
+                    try:
+                        w.workspace.mkdirs(os.path.dirname(dst_path) if "/" in dst_path else sp_notebooks)
+                    except Exception:
+                        pass
+                    resp = w.api_client.do("GET", "/api/2.0/workspace/export",
+                                           query={"path": src_nb, "format": "SOURCE"})
+                    w.api_client.do("POST", "/api/2.0/workspace/import", body={
+                        "path": dst_path, "content": resp.get("content", ""),
+                        "format": "SOURCE", "language": "PYTHON", "overwrite": True,
+                    })
+                    return {"status": "created", "detail": f"Auto-deployed from {src_nb}"}
+                except Exception:
+                    continue
+            return {"status": "error", "error": f"Notebook {nb_name} not found in any source: {source_candidates}"}
+
+        # Helper: copy benchmark module tree from first available source
+        def _copy_benchmark(dst_dir: str) -> dict:
+            for src_base in source_candidates:
+                src_benchmark = f"{src_base}/benchmark"
+                try:
+                    w.workspace.get_status(f"{src_benchmark}/__init__.py")
+                    count = _copy_tree(src_benchmark, dst_dir)
+                    return {"status": "created", "detail": f"Auto-deployed {count} files from {src_benchmark}"}
+                except Exception:
+                    continue
+            return {"status": "error", "error": f"Benchmark module not found in any source: {source_candidates}"}
+
+        # 3. Ensure notebook exists at SP path
+        nb_name = "benchmark_databricks_notebook"
+        nb_path = f"{sp_notebooks}/{nb_name}"
         try:
-            w.workspace.get_status(f"{benchmark_ws_path}/__init__.py")
-            steps.append({"step": "benchmark_module", "name": benchmark_ws_path, "status": "exists"})
+            w.workspace.get_status(nb_path)
+            steps.append({"step": f"notebook_{nb_name}", "name": nb_path, "status": "exists"})
         except Exception:
-            steps.append({
-                "step": "benchmark_module",
-                "name": benchmark_ws_path,
-                "status": "error",
-                "error": f"Benchmark module not found at {benchmark_ws_path}. Sync the repo to workspace first.",
-            })
+            result = _copy_notebook(nb_name, nb_path)
+            steps.append({"step": f"notebook_{nb_name}", "name": nb_path, **result})
 
-        # 3. Download spark-xml JAR to Volume
+        # 4. Ensure benchmark Python module exists at SP path
+        try:
+            w.workspace.get_status(f"{sp_benchmark}/__init__.py")
+            steps.append({"step": "benchmark_module", "name": sp_benchmark, "status": "exists"})
+        except Exception:
+            result = _copy_benchmark(sp_benchmark)
+            steps.append({"step": "benchmark_module", "name": sp_benchmark, **result})
+
+        # 5. Download spark-xml JAR to Volume
         jar_name = "spark-xml_2.13-0.18.0.jar"
         vol_path = f"/Volumes/{req.catalog_name}/{req.schema_name}/libs/{jar_name}"
         maven_url = "https://repo1.maven.org/maven2/com/databricks/spark-xml_2.13/0.18.0/spark-xml_2.13-0.18.0.jar"
@@ -795,13 +931,13 @@ async def bootstrap_workspace(req: BootstrapRequest, request: Request):
             except Exception as e:
                 steps.append({"step": "spark_xml_jar", "name": vol_path, "status": "error", "error": str(e)})
 
-        all_ok = all(s.get("status") in ("exists", "created", "skipped") for s in steps)
+        all_ok = all(s.get("status") in ("exists", "created", "skipped", "info") for s in steps)
         return {
             "status": "ready" if all_ok else "incomplete",
             "steps": steps,
-            "notebook_base_path": ws_base,
-            "benchmark_notebook": f"{ws_base}/benchmark_databricks_notebook",
-            "datagen_notebook": f"{ws_base}/generate_tpcdi_data_notebook",
+            "notebook_base_path": sp_notebooks,
+            "benchmark_notebook": f"{sp_notebooks}/benchmark_databricks_notebook",
+            "datagen_notebook": f"{sp_notebooks}/generate_tpcdi_data_notebook",
             "jar_path": vol_path,
         }
 

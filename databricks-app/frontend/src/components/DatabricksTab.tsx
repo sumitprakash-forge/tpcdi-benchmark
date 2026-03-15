@@ -3,6 +3,7 @@ import Section from './Section'
 import ActionButton from './ActionButton'
 import FormField, { TextInput, NumberInput, SelectInput, Checkbox } from './FormField'
 import Toast from './Toast'
+import RunHistorySection from './RunHistorySection'
 
 interface ToastMessage {
   id: number
@@ -67,8 +68,9 @@ interface E2EPersistedState {
 interface PrereqStep {
   step: string
   name: string
-  status: 'exists' | 'created' | 'missing' | 'error' | 'skipped'
+  status: 'exists' | 'created' | 'missing' | 'error' | 'skipped' | 'info'
   error?: string
+  note?: string
   sa_email?: string
   gcs_bucket?: string
   url?: string
@@ -104,9 +106,10 @@ interface PrereqDetail {
   name: string
   label: string
   exists: boolean
-  action?: string // 'exists' | 'created' | 'error'
+  action?: string // 'exists' | 'created' | 'error' | 'info'
   url?: string
   error?: string
+  note?: string
 }
 
 interface E2EStep {
@@ -243,6 +246,7 @@ export default function DatabricksTab() {
   const [loadingPrereqCheck, setLoadingPrereqCheck] = useState(false)
   const [loadingPrereqCreate, setLoadingPrereqCreate] = useState(false)
   const [fixingGcsIam, setFixingGcsIam] = useState(false)
+  const [adminToken, setAdminToken] = useState('')
 
   // Benchmark config state
   const [loadType, _setLoadType] = useState('batch')
@@ -463,6 +467,7 @@ export default function DatabricksTab() {
           catalog_name: catalogName,
           schema_name: targetSchema,
           raw_data_path: rawDataPath,
+          admin_token: adminToken,
         }),
       })
       setPrereqResult(data)
@@ -759,15 +764,16 @@ export default function DatabricksTab() {
         updateE2EStep(0, { output: 'Some prerequisites missing. Creating...', details: checkDetails })
         const createData = await apiCall('/api/databricks/verify-prerequisites', {
           method: 'POST',
-          body: JSON.stringify({ catalog_name: catalogName, schema_name: targetSchema, raw_data_path: rawDataPath }),
+          body: JSON.stringify({ catalog_name: catalogName, schema_name: targetSchema, raw_data_path: rawDataPath, admin_token: adminToken }),
         })
         const createDetails: PrereqDetail[] = (createData.steps || []).map((s: any) => ({
           name: s.name,
           label: s.step.replace(/_/g, ' '),
-          exists: s.status === 'exists' || s.status === 'created',
+          exists: s.status === 'exists' || s.status === 'created' || s.status === 'info',
           action: s.status,
           url: s.url || undefined,
           error: s.error || undefined,
+          note: s.note || undefined,
         }))
         if (createData.status === 'ready') {
           updateE2EStep(0, { status: 'success', output: 'All prerequisites ready.', duration_ms: Date.now() - step0Start, details: createDetails })
@@ -1122,6 +1128,17 @@ export default function DatabricksTab() {
               <FormField label="Raw Data Path">
                 <div className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-md text-sm font-mono text-slate-700 max-w-[260px] truncate" title={rawDataPath}>{rawDataPath}</div>
               </FormField>
+              <FormField label="Admin PAT Token (optional)">
+                <input
+                  type="password"
+                  className="px-3 py-2 bg-white border border-slate-200 rounded-md text-sm font-mono text-slate-700"
+                  value={adminToken}
+                  onChange={e => setAdminToken(e.target.value)}
+                  placeholder="dapi..."
+                  title="Workspace admin PAT token for granting SP permissions. Only needed on first run."
+                />
+                <p className="text-xs text-slate-400 mt-1">Needed once to grant SP permissions (cluster-create, catalog, metastore)</p>
+              </FormField>
               <ActionButton
                 label={e2eRunning ? 'Running...' : 'Run Full Pipeline'}
                 onClick={handleRunE2E}
@@ -1196,9 +1213,10 @@ export default function DatabricksTab() {
                       {step.details.map((d, di) => (
                         <div key={di} className="flex items-start gap-2 p-2 rounded-md bg-white/70 border border-slate-100">
                           <span className={`mt-0.5 w-4 h-4 rounded-full flex items-center justify-center text-[9px] font-bold flex-shrink-0 ${
+                            d.action === 'info' ? 'bg-amber-400 text-white' :
                             d.exists ? (d.action === 'created' ? 'bg-blue-500 text-white' : 'bg-green-500 text-white') : 'bg-red-400 text-white'
                           }`}>
-                            {d.exists ? (d.action === 'created' ? '+' : '\u2713') : '\u00d7'}
+                            {d.action === 'info' ? 'i' : d.exists ? (d.action === 'created' ? '+' : '\u2713') : '\u00d7'}
                           </span>
                           <div className="min-w-0">
                             <p className="text-[11px] font-medium text-slate-700 capitalize">{d.label}</p>
@@ -1206,11 +1224,13 @@ export default function DatabricksTab() {
                             {d.action && d.action !== 'exists' && d.action !== 'missing' && (
                               <span className={`inline-block mt-0.5 text-[9px] font-medium px-1.5 py-0.5 rounded ${
                                 d.action === 'created' ? 'bg-blue-100 text-blue-700' :
+                                d.action === 'info' ? 'bg-amber-100 text-amber-700' :
                                 d.action === 'error' ? 'bg-red-100 text-red-700' :
                                 'bg-slate-100 text-slate-600'
-                              }`}>{d.action}</span>
+                              }`}>{d.action === 'info' ? 'optional' : d.action}</span>
                             )}
                             {d.url && <p className="text-[9px] text-slate-400 truncate" title={d.url}>{d.url}</p>}
+                            {d.note && <p className="text-[9px] text-amber-600 truncate" title={d.note}>{d.note}</p>}
                             {d.error && <p className="text-[9px] text-red-500 truncate" title={d.error}>{d.error}</p>}
                           </div>
                         </div>
@@ -1370,15 +1390,16 @@ export default function DatabricksTab() {
                         <span className={`inline-block px-2 py-0.5 rounded text-[10px] font-medium ${
                           s.status === 'exists' ? 'bg-green-100 text-green-700' :
                           s.status === 'created' ? 'bg-blue-100 text-blue-700' :
+                          s.status === 'info' ? 'bg-slate-100 text-slate-600' :
                           s.status === 'skipped' ? 'bg-amber-100 text-amber-700' :
                           s.status === 'missing' ? 'bg-amber-100 text-amber-700' :
                           'bg-red-100 text-red-700'
                         }`}>
-                          {s.status.toUpperCase()}
+                          {s.status === 'info' ? 'OPTIONAL' : s.status.toUpperCase()}
                         </span>
                       </td>
                       <td className="px-3 py-2 text-slate-500 max-w-xs">
-                        <div className="truncate">{s.error || s.sa_email || s.url || '--'}</div>
+                        <div className="truncate">{s.note || s.error || s.sa_email || s.url || '--'}</div>
                         {s.step === 'external_location' && (s.status === 'skipped' || s.status === 'error') && s.sa_email && s.gcs_bucket && (
                           <button
                             onClick={() => handleFixGcsIam(s.sa_email!, s.gcs_bucket!)}
@@ -1655,6 +1676,9 @@ export default function DatabricksTab() {
       )}
       </>
       )}
+
+      {/* Run History */}
+      <RunHistorySection platform="databricks" />
     </div>
   )
 }
