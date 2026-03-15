@@ -390,32 +390,19 @@ export default function DatabricksTab() {
     }
   }, [jobId])
 
-  // Persist E2E state to localStorage
+  // Persist E2E state to localStorage — never persist running=true to avoid stale spinners on refresh
   useEffect(() => {
     const state: E2EPersistedState = {
       steps: e2eSteps,
       sf: e2eSF,
       runId: e2eRunId,
       activeStep: e2eActiveStep,
-      running: e2eRunning,
+      running: false,  // Always persist as false — polling useEffect resumes if runId is active
       costs: runCosts,
       remainingSpecs: e2eRemainingSpecs,
     }
     localStorage.setItem(E2E_STATE_KEY, JSON.stringify(state))
   }, [e2eSteps, e2eSF, e2eRunId, e2eActiveStep, e2eRunning, runCosts, e2eRemainingSpecs])
-
-  // On page load: always clear persisted "running" state.
-  // If e2eRunId is set, the polling useEffect will re-check the run and either
-  // resume polling (if still active) or mark it terminal — no stale spinner.
-  useEffect(() => {
-    if (e2eRunning) {
-      setE2eRunning(false)
-    }
-    if (manualRunning) {
-      setManualRunning(false)
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []) // Only on mount
 
   // Auto-save E2E run history when pipeline completes (uses fresh state, no stale closure)
   useEffect(() => {
@@ -743,6 +730,8 @@ export default function DatabricksTab() {
   // Polling useEffect - runs whenever e2eRunId changes (including after page refresh)
   useEffect(() => {
     if (!e2eRunId || e2eActiveStep === null) return
+    // If we have a valid runId, mark as running (handles page refresh resume)
+    setE2eRunning(true)
     const stepIdx = e2eActiveStep
     const sf = parseInt(e2eSF)
     // Find matching spec to build label
@@ -824,7 +813,7 @@ export default function DatabricksTab() {
       if (done) clearInterval(interval)
     }, 10000)
     return () => clearInterval(interval)
-  }, [e2eRunId, e2eActiveStep])
+  }, [e2eRunId, e2eActiveStep, adminToken])
 
   // Auto-continue: when e2eNextSpec is set, start the next run
   useEffect(() => {
@@ -1065,7 +1054,7 @@ export default function DatabricksTab() {
       if (done) clearInterval(interval)
     }, 10000)
     return () => clearInterval(interval)
-  }, [manualRunId, manualActiveStep])
+  }, [manualRunId, manualActiveStep, adminToken])
 
   // Manual pipeline auto-continue
   useEffect(() => {

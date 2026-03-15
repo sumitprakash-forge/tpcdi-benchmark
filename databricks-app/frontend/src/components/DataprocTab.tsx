@@ -144,8 +144,7 @@ export default function DataprocTab() {
   const [region, setRegion] = useState('us-central1')
   const [zone, setZone] = useState('us-central1-a')
   const [subnet, setSubnet] = useState('tpcdi-benchmark-subnet')
-  const [metastoreMode, setMetastoreMode] = useState<'spark_default' | 'create' | 'existing'>('spark_default')
-  const [metastore, setMetastore] = useState('')
+  const [metastoreMode] = useState<'spark_default' | 'create' | 'existing'>('create')
   const [metastoreName, setMetastoreName] = useState('tpcdi-benchmark-metastore')
   const [gcsBucket, setGcsBucket] = useState('sumit_prakash_gcs')
   const [rawDataPath, setRawDataPath] = useState('gs://sumit_prakash_gcs/tpcdi')
@@ -418,7 +417,7 @@ export default function DataprocTab() {
         body: JSON.stringify({
           cluster_name: clName,
           project, region, zone, subnet,
-          metastore: metastoreMode === 'existing' ? metastore : (metastoreMode === 'create' ? `projects/${project}/locations/${region}/services/${metastoreName}` : ''),
+          metastore: metastoreMode === 'create' ? `projects/${project}/locations/${region}/services/${metastoreName}` : '',
           image_version: '2.3-debian12',
           master_type: sizing.master,
           worker_type: sizing.worker,
@@ -632,7 +631,7 @@ export default function DataprocTab() {
           project, region, subnet, gcs_bucket: gcsBucket,
           metastore_mode: metastoreMode,
           metastore_name: metastoreName,
-          metastore_path: metastore,
+          metastore_path: metastoreMode === 'create' ? `projects/${project}/locations/${region}/services/${metastoreName}` : '',
           gcp_refresh_token: gcpRefreshToken.trim(),
         }),
       })
@@ -713,7 +712,7 @@ export default function DataprocTab() {
         body: JSON.stringify({
           cluster_name: cfg.clusterName,
           project, region, zone, subnet,
-          metastore: metastoreMode === 'existing' ? metastore : (metastoreMode === 'create' ? `projects/${project}/locations/${region}/services/${metastoreName}` : ''),
+          metastore: metastoreMode === 'create' ? `projects/${project}/locations/${region}/services/${metastoreName}` : '',
           image_version: '2.3-debian12',
           master_type: cfg.masterType,
           worker_type: cfg.workerType,
@@ -976,7 +975,7 @@ export default function DataprocTab() {
           project, region, subnet, gcs_bucket: gcsBucket,
           metastore_mode: metastoreMode,
           metastore_name: metastoreName,
-          metastore_path: metastore,
+          metastore_path: metastoreMode === 'create' ? `projects/${project}/locations/${region}/services/${metastoreName}` : '',
         }),
       })
 
@@ -1143,27 +1142,10 @@ export default function DataprocTab() {
               <FormField label="Raw Data Path">
                 <div className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-md text-sm font-mono text-slate-700 max-w-[260px] truncate" title={rawDataPath}>{rawDataPath}</div>
               </FormField>
-              <FormField label="Hive Metastore">
-                <SelectInput
-                  value={metastoreMode}
-                  onChange={(v) => setMetastoreMode(v as 'spark_default' | 'create' | 'existing')}
-                  options={[
-                    { value: 'spark_default', label: 'Spark Default' },
-                    { value: 'create', label: 'Create Dataproc Metastore' },
-                    { value: 'existing', label: 'Use Existing Metastore' },
-                  ]}
-                />
+              <FormField label="Dataproc Metastore">
+                <TextInput value={metastoreName} onChange={setMetastoreName} placeholder="tpcdi-benchmark-metastore" />
+                <p className="text-xs text-slate-500 mt-0.5">Creates if not exists, reuses if already created</p>
               </FormField>
-              {metastoreMode === 'create' && (
-                <FormField label="Metastore Name">
-                  <TextInput value={metastoreName} onChange={setMetastoreName} placeholder="tpcdi-benchmark-metastore" />
-                </FormField>
-              )}
-              {metastoreMode === 'existing' && (
-                <FormField label="Metastore Path">
-                  <TextInput value={metastore} onChange={setMetastore} placeholder="projects/.../locations/.../services/..." />
-                </FormField>
-              )}
               <ActionButton
                 label={e2eRunning ? 'Running...' : !gcpTokenUser ? 'Provide GCP Token' : 'Run Full Pipeline'}
                 onClick={handleRunE2E}
@@ -1392,27 +1374,10 @@ export default function DataprocTab() {
             <FormField label="GCS Bucket">
               <TextInput value={gcsBucket} onChange={setGcsBucket} placeholder="my-bucket" />
             </FormField>
-            <FormField label="Hive Metastore">
-              <SelectInput
-                value={metastoreMode}
-                onChange={(v) => setMetastoreMode(v as 'spark_default' | 'create' | 'existing')}
-                options={[
-                  { value: 'spark_default', label: 'Spark Default (no external metastore)' },
-                  { value: 'create', label: 'Create Dataproc Metastore' },
-                  { value: 'existing', label: 'Use Existing Metastore' },
-                ]}
-              />
+            <FormField label="Dataproc Metastore">
+              <TextInput value={metastoreName} onChange={setMetastoreName} placeholder="tpcdi-benchmark-metastore" />
+              <p className="text-xs text-slate-500 mt-0.5">Creates if not exists, reuses if already created</p>
             </FormField>
-            {metastoreMode === 'create' && (
-              <FormField label="Metastore Name">
-                <TextInput value={metastoreName} onChange={setMetastoreName} placeholder="tpcdi-benchmark-metastore" />
-              </FormField>
-            )}
-            {metastoreMode === 'existing' && (
-              <FormField label="Metastore Service Path">
-                <TextInput value={metastore} onChange={setMetastore} placeholder="projects/.../locations/.../services/..." />
-              </FormField>
-            )}
           </div>
 
           {/* Check Prerequisites */}
