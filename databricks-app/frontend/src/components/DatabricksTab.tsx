@@ -246,7 +246,7 @@ export default function DatabricksTab() {
   const [loadingPrereqCheck, setLoadingPrereqCheck] = useState(false)
   const [loadingPrereqCreate, setLoadingPrereqCreate] = useState(false)
   const [fixingGcsIam, setFixingGcsIam] = useState(false)
-  const [adminToken, setAdminToken] = useState('')
+  const [adminToken, setAdminToken] = useState(() => localStorage.getItem('tpcdi_databricks_pat') || '')
   const [tokenUser, setTokenUser] = useState<{ user_name: string; display_name: string } | null>(null)
   const [resolvingToken, setResolvingToken] = useState(false)
   const [tokenError, setTokenError] = useState<string | null>(null)
@@ -372,6 +372,15 @@ export default function DatabricksTab() {
   const manualStartingRef = useRef(false)
   const [manualSaveNeeded, setManualSaveNeeded] = useState(false)
 
+  // Persist PAT token to localStorage
+  useEffect(() => {
+    if (adminToken) {
+      localStorage.setItem('tpcdi_databricks_pat', adminToken)
+    } else {
+      localStorage.removeItem('tpcdi_databricks_pat')
+    }
+  }, [adminToken])
+
   // Persist jobId to localStorage
   useEffect(() => {
     if (jobId) {
@@ -394,6 +403,19 @@ export default function DatabricksTab() {
     }
     localStorage.setItem(E2E_STATE_KEY, JSON.stringify(state))
   }, [e2eSteps, e2eSF, e2eRunId, e2eActiveStep, e2eRunning, runCosts, e2eRemainingSpecs])
+
+  // On page load: always clear persisted "running" state.
+  // If e2eRunId is set, the polling useEffect will re-check the run and either
+  // resume polling (if still active) or mark it terminal — no stale spinner.
+  useEffect(() => {
+    if (e2eRunning) {
+      setE2eRunning(false)
+    }
+    if (manualRunning) {
+      setManualRunning(false)
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []) // Only on mount
 
   // Auto-save E2E run history when pipeline completes (uses fresh state, no stale closure)
   useEffect(() => {
@@ -753,7 +775,8 @@ export default function DatabricksTab() {
           // Fetch cost
           if (isSuccess) {
             try {
-              const costData = await apiCall(`/api/databricks/run-cost/${e2eRunId}`)
+              const costTokenParam = adminToken ? `?admin_token=${encodeURIComponent(adminToken)}` : ''
+              const costData = await apiCall(`/api/databricks/run-cost/${e2eRunId}${costTokenParam}`)
               setRunCosts(prev => {
                 const next = [...prev]
                 next[stepIdx - 1] = costData
@@ -906,7 +929,7 @@ export default function DatabricksTab() {
     setCancelling(true)
     e2eCancelledRef.current = true
     try {
-      await apiCall(`/api/databricks/cancel-run/${e2eRunId}`, { method: 'POST' })
+      await apiCall(`/api/databricks/cancel-run/${e2eRunId}?admin_token=${encodeURIComponent(adminToken)}`, { method: 'POST' })
       addToast(`Run ${e2eRunId} cancellation requested`, 'info')
       if (e2eActiveStep !== null) {
         updateE2EStep(e2eActiveStep, { output: `Cancellation requested for run ${e2eRunId}. Waiting for confirmation...` })
@@ -1015,7 +1038,8 @@ export default function DatabricksTab() {
           })
           if (isSuccess) {
             try {
-              const costData = await apiCall(`/api/databricks/run-cost/${manualRunId}`)
+              const mCostParam = adminToken ? `?admin_token=${encodeURIComponent(adminToken)}` : ''
+              const costData = await apiCall(`/api/databricks/run-cost/${manualRunId}${mCostParam}`)
               setManualCosts(prev => {
                 const next = [...prev]
                 next[stepIdx] = costData
@@ -1090,7 +1114,7 @@ export default function DatabricksTab() {
     setManualCancelling(true)
     manualCancelledRef.current = true
     try {
-      await apiCall(`/api/databricks/cancel-run/${manualRunId}`, { method: 'POST' })
+      await apiCall(`/api/databricks/cancel-run/${manualRunId}?admin_token=${encodeURIComponent(adminToken)}`, { method: 'POST' })
       addToast(`Run ${manualRunId} cancellation requested`, 'info')
       if (manualActiveStep !== null) {
         updateManualStep(manualActiveStep, { output: `Cancellation requested for run ${manualRunId}. Waiting for confirmation...` })
@@ -1111,7 +1135,8 @@ export default function DatabricksTab() {
   const pollStatus = useCallback(async () => {
     if (!runId) return
     try {
-      const status = await apiCall(`/api/databricks/job-status/${runId}`)
+      const pollTokenParam = adminToken ? `?admin_token=${encodeURIComponent(adminToken)}` : ''
+      const status = await apiCall(`/api/databricks/job-status/${runId}${pollTokenParam}`)
       setJobStatus(status)
       // Update the run in jobRuns list too
       setJobRuns((prev) =>

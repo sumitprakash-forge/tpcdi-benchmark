@@ -212,11 +212,9 @@ export default function DataprocTab() {
   const manualCancelledRef = useRef(false)
 
   // Google auth state
-  const [gcpAuth, setGcpAuth] = useState<{ status: string; method?: string; account?: string; message?: string } | null>(null)
-  const [loadingAuth, setLoadingAuth] = useState(false)
-  const [showTokenInput, setShowTokenInput] = useState(false)
-  const [tokenInput, setTokenInput] = useState('')
-  const [tokenType, setTokenType] = useState<'refresh_token' | 'access_token' | 'adc_json'>('refresh_token')
+  const [_gcpAuth, setGcpAuth] = useState<{ status: string; method?: string; account?: string; message?: string } | null>(null)
+  const [_loadingAuth, setLoadingAuth] = useState(false)
+
 
   // Mandatory GCP refresh token (persisted in localStorage, auto-refreshes before every run)
   const [gcpRefreshToken, setGcpRefreshToken] = useState(() => localStorage.getItem('tpcdi_gcp_refresh_token') || '')
@@ -248,6 +246,16 @@ export default function DataprocTab() {
     }
     localStorage.setItem(E2E_STATE_KEY, JSON.stringify(state))
   }, [e2eSteps, e2eSF, e2eRunId, e2eActiveStep, e2eRunning, runCosts, e2eRemainingSpecs])
+
+  // Detect stale "running" state on mount — if running but no active run ID, reset
+  // On page load: always clear persisted "running" state to prevent stale spinners.
+  // Dataproc runs are in-memory on the server, so after a server restart they're gone anyway.
+  useEffect(() => {
+    if (e2eRunning) {
+      setE2eRunning(false)
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []) // Only on mount
 
   // Auto-save Dataproc E2E run history when pipeline completes (uses fresh state)
   useEffect(() => {
@@ -336,29 +344,6 @@ export default function DataprocTab() {
   }, [])
 
   useEffect(() => { checkGcpAuth() }, [])
-
-  async function handleTokenSubmit() {
-    if (!tokenInput.trim()) return
-    setLoadingAuth(true)
-    try {
-      const data = await apiCall('/api/dataproc/auth/login', {
-        method: 'POST',
-        body: JSON.stringify({ token: tokenInput.trim(), token_type: tokenType }),
-      })
-      setGcpAuth(data)
-      if (data.status === 'authenticated') {
-        setShowTokenInput(false)
-        setTokenInput('')
-        addToast(`Authenticated as ${data.account}`, 'success')
-      } else {
-        addToast(data.message || 'Authentication failed', 'error')
-      }
-    } catch (e: any) {
-      addToast(`Auth failed: ${e.message}`, 'error')
-    } finally {
-      setLoadingAuth(false)
-    }
-  }
 
   async function handleLogout() {
     await apiCall('/api/dataproc/auth/logout', { method: 'POST' })
@@ -616,6 +601,7 @@ export default function DataprocTab() {
     const step0Start = Date.now()
     try {
       // Auto-refresh: if refresh token is provided, re-authenticate first
+      let authAccount = ''
       if (gcpRefreshToken.trim()) {
         const refreshResult = await apiCall('/api/dataproc/auth/login', {
           method: 'POST',
@@ -627,7 +613,8 @@ export default function DataprocTab() {
           return
         }
         setGcpAuth(refreshResult)
-        updateE2EStep(0, { output: `Authenticated as ${refreshResult.account}. Checking & creating prerequisites...` })
+        authAccount = refreshResult.account || ''
+        updateE2EStep(0, { output: `Authenticated as ${authAccount}. Checking & creating prerequisites...` })
       } else {
         const auth = await apiCall('/api/dataproc/auth/status')
         if (auth.status !== 'authenticated') {
@@ -635,7 +622,8 @@ export default function DataprocTab() {
           setE2eRunning(false)
           return
         }
-        updateE2EStep(0, { output: `Authenticated as ${auth.account}. Checking & creating prerequisites...` })
+        authAccount = auth.account || ''
+        updateE2EStep(0, { output: `Authenticated as ${authAccount}. Checking & creating prerequisites...` })
       }
 
       const prereqs = await apiCall('/api/dataproc/verify-prerequisites', {
@@ -659,7 +647,7 @@ export default function DataprocTab() {
       if (prereqs.status === 'ready') {
         updateE2EStep(0, {
           status: 'success',
-          output: `Authenticated as ${auth.account}. All prerequisites ready.`,
+          output: `Authenticated as ${authAccount}. All prerequisites ready.`,
           duration_ms: Date.now() - step0Start,
           details: prereqDetails,
         })

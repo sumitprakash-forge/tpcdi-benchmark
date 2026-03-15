@@ -1388,10 +1388,10 @@ async def _list_metrics_dbfs(w, metrics_path: str):
 # ── Run Cost Calculation ──────────────────────────────────────────────────
 
 @router.get("/databricks/run-cost/{run_id}")
-async def get_run_cost(run_id: int, request: Request):
+async def get_run_cost(run_id: int, request: Request, admin_token: str = Query("")):
     """Calculate cost breakdown for a completed job run."""
     try:
-        w = get_workspace_client(request)
+        w = get_workspace_client_with_token(admin_token) if admin_token else get_workspace_client(request)
         # Get run details via REST API for raw JSON access
         run_data = w.api_client.do("GET", "/api/2.1/jobs/runs/get", query={"run_id": run_id})
 
@@ -1448,10 +1448,10 @@ async def get_run_cost(run_id: int, request: Request):
 # ── Cancel Run ────────────────────────────────────────────────────────────
 
 @router.post("/databricks/cancel-run/{run_id}")
-async def cancel_run(run_id: int, request: Request):
+async def cancel_run(run_id: int, request: Request, admin_token: str = Query("")):
     """Cancel a running job."""
     try:
-        w = get_workspace_client(request)
+        w = get_workspace_client_with_token(admin_token) if admin_token else get_workspace_client(request)
         w.jobs.cancel_run(run_id=run_id)
         return {"status": "cancelled", "run_id": run_id}
     except Exception as e:
@@ -1525,6 +1525,40 @@ async def grant_ext_location(req: GrantExtLocationRequest, request: Request):
         return {"status": "granted", "principal": req.principal, "privileges": req.privileges}
     except Exception as e:
         traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/databricks/fix-ext-location-owner")
+async def fix_ext_location_owner(request: Request, ext_location_name: str = "gcp_tpcdi_sandbox_raw_data", new_owner: str = ""):
+    """Transfer ext location ownership from SP to workspace admin, then grant READ/WRITE.
+    Only works when called from the Databricks App (SP context).
+    """
+    try:
+        w = get_workspace_client(request)  # SP client
+        results = []
+
+        # Step 1: Transfer ownership to the new_owner (or current user)
+        if new_owner:
+            try:
+                w.api_client.do("PATCH",
+                    f"/api/2.1/unity-catalog/external-locations/{ext_location_name}",
+                    body={"owner": new_owner})
+                results.append(f"Ownership transferred to {new_owner}")
+            except Exception as e:
+                results.append(f"Ownership transfer failed: {e}")
+
+        # Step 2: Grant READ_FILES, WRITE_FILES to all users
+        for principal in ["account users"]:
+            try:
+                w.api_client.do("PATCH",
+                    f"/api/2.1/unity-catalog/permissions/external_location/{ext_location_name}",
+                    body={"changes": [{"principal": principal, "add": ["READ_FILES", "WRITE_FILES"]}]})
+                results.append(f"Granted READ/WRITE to {principal}")
+            except Exception as e:
+                results.append(f"Grant to {principal} failed: {e}")
+
+        return {"status": "ok", "results": results}
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
