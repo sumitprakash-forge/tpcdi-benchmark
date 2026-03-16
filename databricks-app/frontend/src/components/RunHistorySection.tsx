@@ -13,6 +13,7 @@ interface RunHistoryCost {
   dataproc_premium_usd?: number
   ssd_cost_usd?: number
   total_cost_usd?: number
+  dcu_hours?: number
   duration_ms?: number
   duration_hours?: number
   cluster?: {
@@ -401,11 +402,15 @@ export default function RunHistorySection({ platform }: RunHistorySectionProps) 
                                         {cluster ? (
                                           <div className="leading-tight">
                                             {platform === 'dataproc' ? (
-                                              <>
-                                                <div>M: {cluster.master_type || '--'}</div>
-                                                <div>W: {cluster.worker_type || '--'} x{cluster.num_workers ?? '--'}</div>
-                                                {(cluster.ssd_count != null && cluster.ssd_count > 0) && <div>SSD: {cluster.ssd_count}/node</div>}
-                                              </>
+                                              (cluster.master_type || '').startsWith('Serverless') ? (
+                                                <div>{cluster.master_type}</div>
+                                              ) : (
+                                                <>
+                                                  <div>M: {cluster.master_type || '--'}</div>
+                                                  <div>W: {cluster.worker_type || '--'} x{cluster.num_workers ?? '--'}</div>
+                                                  {(cluster.ssd_count != null && cluster.ssd_count > 0) && <div>SSD: {cluster.ssd_count}/node</div>}
+                                                </>
+                                              )
                                             ) : (
                                               <>
                                                 <div>D: {cluster.driver_node_type || cluster.driver_type || '--'}</div>
@@ -431,15 +436,27 @@ export default function RunHistorySection({ platform }: RunHistorySectionProps) 
                                       </td>
                                       <td className="py-1.5 pr-4 font-mono">
                                         {stepCost?.total_cost_usd != null ? (
-                                          <span>
-                                            <span className="text-slate-500">${stepCost.vm_cost_usd?.toFixed(2) ?? '0.00'}</span>
-                                            {' + '}
-                                            <span className="text-slate-500">${stepCost.dbu_cost_usd?.toFixed(2) ?? stepCost.dataproc_premium_usd?.toFixed(2) ?? '0.00'}</span>
-                                            {' + '}
-                                            <span className="text-slate-500">${stepCost.ssd_cost_usd?.toFixed(2) ?? '0.00'}</span>
-                                            {' = '}
-                                            <span className="font-medium">${stepCost.total_cost_usd.toFixed(2)}</span>
-                                          </span>
+                                          (stepCost.cluster?.master_type || '').startsWith('Serverless') ? (
+                                            <span>
+                                              <span className="text-slate-500">DCU: ${stepCost.vm_cost_usd?.toFixed(2) ?? '0.00'}</span>
+                                              {stepCost.dataproc_premium_usd && stepCost.dataproc_premium_usd > 0 ? (
+                                                <>{' + '}<span className="text-slate-500">Shuffle: ${stepCost.dataproc_premium_usd.toFixed(2)}</span></>
+                                              ) : null}
+                                              {' = '}
+                                              <span className="font-medium">${stepCost.total_cost_usd.toFixed(2)}</span>
+                                              {stepCost.dcu_hours ? <span className="text-slate-400 ml-1">({stepCost.dcu_hours.toFixed(1)} DCU-hrs)</span> : null}
+                                            </span>
+                                          ) : (
+                                            <span>
+                                              <span className="text-slate-500">${stepCost.vm_cost_usd?.toFixed(2) ?? '0.00'}</span>
+                                              {' + '}
+                                              <span className="text-slate-500">${stepCost.dbu_cost_usd?.toFixed(2) ?? stepCost.dataproc_premium_usd?.toFixed(2) ?? '0.00'}</span>
+                                              {' + '}
+                                              <span className="text-slate-500">${stepCost.ssd_cost_usd?.toFixed(2) ?? '0.00'}</span>
+                                              {' = '}
+                                              <span className="font-medium">${stepCost.total_cost_usd.toFixed(2)}</span>
+                                            </span>
+                                          )
                                         ) : '--'}
                                       </td>
                                       <td className="py-1.5">

@@ -497,6 +497,7 @@ export default function DataprocTab() {
     // Skip polling for the 'pending' sentinel — wait for a real run ID
     if (!e2eRunId || e2eRunId === 'pending' || e2eActiveStep === null) return
     let failCount = 0
+    let stepDone = false  // prevent double-trigger from concurrent polls
     const stepIdx = e2eActiveStep
     const sf = parseInt(e2eSF)
     const spec = E2E_RUN_SPECS.find(s => s.stepIndex === stepIdx)
@@ -553,6 +554,8 @@ export default function DataprocTab() {
         })
 
         if (status.state === 'DONE') {
+          if (stepDone) return true  // already handled by concurrent poll
+          stepDone = true
           // Build completion summary with timing breakdown
           const timingParts: string[] = [runLabel, 'Done']
           if (status.cluster_created_ms && status.start_time_ms) {
@@ -609,6 +612,8 @@ export default function DataprocTab() {
         }
 
         if (status.state === 'ERROR' || status.state === 'CANCELLED') {
+          if (stepDone) return true
+          stepDone = true
           updateE2EStep(stepIdx, {
             status: 'error',
             output: `${runLabel} | ${status.state}: ${status.error || 'Unknown error'}`,
