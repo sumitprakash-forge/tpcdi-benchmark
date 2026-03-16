@@ -764,7 +764,7 @@ async def _run_serverless_batch_task(run_id: str, req: DataprocFullRunRequest):
             pyspark_batch=dataproc_v1.PySparkBatch(
                 main_python_file_uri=f"gs://{req.gcs_bucket}/tpcdi/dataproc/run_benchmark_dataproc.py",
                 python_file_uris=[f"gs://{req.gcs_bucket}/tpcdi/dataproc/benchmark.zip"],
-                jar_file_uris=[f"gs://{req.gcs_bucket}/tpcdi/libs/spark-xml_2.12-0.18.0.jar"],
+                jar_file_uris=[f"gs://{req.gcs_bucket}/tpcdi/libs/spark-xml_2.13-0.18.0.jar"],
                 args=script_args,
             ),
             runtime_config=dataproc_v1.RuntimeConfig(
