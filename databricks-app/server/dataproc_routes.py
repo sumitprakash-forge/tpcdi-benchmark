@@ -891,7 +891,7 @@ async def _run_serverless_batch_task(run_id: str, req: DataprocFullRunRequest):
         # Determine runtime properties based on serverless tier
         runtime_props = {}
         if req.serverless_tier == "premium":
-            runtime_props["spark.dataproc.serverless.premiumTier"] = "true"
+            runtime_props["dataproc.tier"] = "premium"
 
         batch = dataproc_v1.Batch(
             pyspark_batch=dataproc_v1.PySparkBatch(
