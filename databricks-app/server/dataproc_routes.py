@@ -817,8 +817,8 @@ async def run_full_cycle(req: DataprocFullRunRequest):
         "duration_ms": None,
         "cost": None,
         "config": {
-            "master_type": "serverless" if is_serverless else req.master_type,
-            "worker_type": "serverless" if is_serverless else req.worker_type,
+            "master_type": f"Serverless {'Premium' if req.serverless_tier == 'premium' else 'Standard'}" if is_serverless else req.master_type,
+            "worker_type": f"Serverless {'Premium' if req.serverless_tier == 'premium' else 'Standard'}" if is_serverless else req.worker_type,
             "num_workers": 0 if is_serverless else req.num_workers,
             "ssd_count": 0 if is_serverless else req.ssd_count,
             "load_type": req.load_type, "batch_id": req.batch_id,
@@ -998,34 +998,47 @@ async def _run_serverless_batch_task(run_id: str, req: DataprocFullRunRequest):
         _persist_runs()
 
         # Cost from actual DCU usage reported by Dataproc Serverless
+        # Usage metrics may take ~30s to populate after batch completes — retry
         DCU_PRICE_PER_HOUR = 0.065
-        SHUFFLE_STORAGE_PRICE_PER_GB_HOUR = 0.000054  # premium shuffle storage
+        SHUFFLE_STORAGE_PRICE_PER_GB_HOUR = 0.000054
         hours = total_ms / 3_600_000
         dcu_hours = 0.0
         shuffle_gb_hours = 0.0
-        try:
-            batch_client = _fresh_batch_client()
-            final_batch = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: batch_client.get_batch(
-                    name=f"projects/{req.project}/locations/{req.region}/batches/{batch_id}"
-                ),
-            )
-            usage = final_batch.runtime_info.approximate_usage
-            milli_dcu_seconds = int(usage.milli_dcu_seconds) if usage.milli_dcu_seconds else 0
-            shuffle_gb_seconds = int(usage.shuffle_storage_gb_seconds) if usage.shuffle_storage_gb_seconds else 0
-            dcu_hours = milli_dcu_seconds / 1000.0 / 3600.0
-            shuffle_gb_hours = shuffle_gb_seconds / 3600.0
-            print(f"[dataproc-serverless] Actual usage: {dcu_hours:.3f} DCU-hours, {shuffle_gb_hours:.1f} GB-hours shuffle")
-        except Exception as cost_err:
-            print(f"[dataproc-serverless] WARNING: could not read actual DCU usage: {cost_err}, falling back to estimate")
-            dcu_hours = 4.0 * hours  # fallback estimate
+        tier_label = "Premium" if req.serverless_tier == "premium" else "Standard"
+
+        for attempt in range(4):  # retry up to 4 times (0s, 15s, 30s, 45s)
+            try:
+                if attempt > 0:
+                    await asyncio.sleep(15)
+                batch_client = _fresh_batch_client()
+                final_batch = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: batch_client.get_batch(
+                        name=f"projects/{req.project}/locations/{req.region}/batches/{batch_id}"
+                    ),
+                )
+                usage = final_batch.runtime_info.approximate_usage
+                milli_dcu_seconds = int(usage.milli_dcu_seconds) if usage.milli_dcu_seconds else 0
+                shuffle_gb_seconds = int(usage.shuffle_storage_gb_seconds) if usage.shuffle_storage_gb_seconds else 0
+                dcu_hours = milli_dcu_seconds / 1000.0 / 3600.0
+                shuffle_gb_hours = shuffle_gb_seconds / 3600.0
+                if dcu_hours > 0:
+                    print(f"[dataproc-serverless] Actual usage (attempt {attempt+1}): {dcu_hours:.3f} DCU-hours, {shuffle_gb_hours:.1f} GB-hours shuffle")
+                    break
+                print(f"[dataproc-serverless] Usage not yet populated (attempt {attempt+1}), retrying...")
+            except Exception as cost_err:
+                print(f"[dataproc-serverless] WARNING: DCU read attempt {attempt+1} failed: {cost_err}")
+
+        if dcu_hours == 0:
+            # Final fallback: estimate based on duration
+            dcu_hours = 4.0 * hours
+            print(f"[dataproc-serverless] Using estimated DCU-hours: {dcu_hours:.3f}")
 
         dcu_cost = dcu_hours * DCU_PRICE_PER_HOUR
         shuffle_cost = shuffle_gb_hours * SHUFFLE_STORAGE_PRICE_PER_GB_HOUR
         total_cost = dcu_cost + shuffle_cost
         run["cost"] = {
-            "vm_cost_usd": round(dcu_cost, 4),  # DCU compute cost (analogous to VM cost)
+            "vm_cost_usd": round(dcu_cost, 4),  # DCU compute cost
             "dataproc_premium_usd": round(shuffle_cost, 4),  # shuffle storage cost
             "ssd_cost_usd": 0,
             "total_cost_usd": round(total_cost, 4),
@@ -1033,8 +1046,8 @@ async def _run_serverless_batch_task(run_id: str, req: DataprocFullRunRequest):
             "duration_ms": total_ms,
             "dcu_hours": round(dcu_hours, 4),
             "cluster": {
-                "master_type": "serverless",
-                "worker_type": "serverless",
+                "master_type": f"Serverless {tier_label}",
+                "worker_type": f"Serverless {tier_label}",
                 "num_workers": 0,
                 "ssd_count": 0,
             },
