@@ -83,6 +83,8 @@ interface E2EPersistedState {
   running: boolean
   costs: (DataprocRunCost | null)[]
   remainingSpecs: E2ERunSpec[]
+  lockedComputeMode?: string
+  lockedServerlessTier?: string
 }
 
 const E2E_STATE_KEY = 'tpcdi_dataproc_e2e_state'
@@ -250,6 +252,8 @@ export default function DataprocTab() {
     const state: E2EPersistedState = {
       steps: e2eSteps, sf: e2eSF, runId: e2eRunId, activeStep: e2eActiveStep,
       running: e2eRunning, costs: runCosts, remainingSpecs: e2eRemainingSpecs,
+      lockedComputeMode: e2eLockedComputeMode.current,
+      lockedServerlessTier: e2eLockedServerlessTier.current,
     }
     localStorage.setItem(E2E_STATE_KEY, JSON.stringify(state))
   }, [e2eSteps, e2eSF, e2eRunId, e2eActiveStep, e2eRunning, runCosts, e2eRemainingSpecs])
@@ -433,8 +437,13 @@ export default function DataprocTab() {
 
   const e2eCancelledRef = useRef(false)
   // Lock compute mode at pipeline start so UI changes don't affect running pipeline
-  const e2eLockedComputeMode = useRef<ComputeMode>('classic')
-  const e2eLockedServerlessTier = useRef<'standard' | 'premium'>('standard')
+  // Restored from localStorage on mount if pipeline was running
+  const e2eLockedComputeMode = useRef<ComputeMode>(
+    ((() => { try { const r = localStorage.getItem(E2E_STATE_KEY); return r ? JSON.parse(r).lockedComputeMode : null } catch { return null } })() as ComputeMode) || 'classic'
+  )
+  const e2eLockedServerlessTier = useRef<'standard' | 'premium'>(
+    ((() => { try { const r = localStorage.getItem(E2E_STATE_KEY); return r ? JSON.parse(r).lockedServerlessTier : null } catch { return null } })() as 'standard' | 'premium') || 'standard'
+  )
   const [e2eNextSpec, setE2eNextSpec] = useState<E2ERunSpec | null>(null)
 
   function buildRunLabel(spec: E2ERunSpec, sf: number): string {
