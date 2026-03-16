@@ -676,6 +676,7 @@ async def run_full_cycle(req: DataprocFullRunRequest):
         raise HTTPException(status_code=401, detail="Not authenticated with Google Cloud. Please sign in first.")
 
     run_id = _next_run_id()
+    print(f"[dataproc] run_full_cycle: compute_mode={req.compute_mode!r}, cluster_name={req.cluster_name!r}")
     is_serverless = req.compute_mode == "serverless"
     _active_runs[run_id] = {
         "run_id": run_id,
@@ -740,7 +741,7 @@ async def _run_serverless_batch_task(run_id: str, req: DataprocFullRunRequest):
         # No cluster creation phase — go straight to job submission
         run["phase"] = "submitting_batch"
 
-        # Build the same script args as classic
+        # Build script args — no spark-master for serverless
         script_args = [
             "--load-type", req.load_type,
             "--scale-factor", str(req.scale_factor),
@@ -753,7 +754,7 @@ async def _run_serverless_batch_task(run_id: str, req: DataprocFullRunRequest):
             "--target-schema=dw",
             "--save-metrics",
             f"--metrics-output={req.metrics_output}",
-            "--spark-master=yarn",
+            "--no-spark-master",
             "--log-detailed-stats",
         ]
         if req.batch_id:
@@ -1019,7 +1020,7 @@ async def _run_full_cycle_task(run_id: str, req: DataprocFullRunRequest):
             "--target-schema=dw",
             "--save-metrics",
             f"--metrics-output={req.metrics_output}",
-            "--no-spark-master",
+            "--spark-master=yarn",
             "--log-detailed-stats",
         ]
         if req.batch_id:
