@@ -467,6 +467,7 @@ export default function DataprocTab() {
           target_database: targetDatabase,
           metrics_output: metricsOutput,
           gcp_refresh_token: gcpRefreshToken.trim(),
+          compute_mode: computeMode,
         }),
       })
       setE2eRunId(result.run_id)
@@ -491,6 +492,7 @@ export default function DataprocTab() {
 
     const phaseIcon = (phase: string) => {
       if (phase.includes('creating')) return 'Cluster provisioning'
+      if (phase.includes('submitting_batch')) return 'Submitting batch'
       if (phase.includes('running_job')) return 'Job executing'
       if (phase.includes('deleting')) return 'Cluster teardown'
       if (phase === 'completed') return 'Complete'
@@ -788,6 +790,7 @@ export default function DataprocTab() {
           target_database: targetDatabase,
           metrics_output: metricsOutput,
           gcp_refresh_token: gcpRefreshToken.trim(),
+          compute_mode: computeMode,
         }),
       })
       setManualRunId(result.run_id)
@@ -810,6 +813,7 @@ export default function DataprocTab() {
 
     const phaseIcon = (phase: string) => {
       if (phase.includes('creating')) return 'Cluster provisioning'
+      if (phase.includes('submitting_batch')) return 'Submitting batch'
       if (phase.includes('running_job')) return 'Job executing'
       if (phase.includes('deleting')) return 'Cluster teardown'
       if (phase === 'completed') return 'Complete'

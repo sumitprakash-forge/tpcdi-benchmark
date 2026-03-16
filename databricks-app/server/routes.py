@@ -178,6 +178,7 @@ class JobCreateRequest(BaseModel):
     log_detailed_stats: bool = True
     job_id: Optional[int] = None
     admin_token: str = ""  # PAT token — job runs as this user
+    compute_mode: str = "classic"  # "classic" or "serverless"
 
 
 class RunJobRequest(BaseModel):
@@ -1072,45 +1073,66 @@ async def create_job(req: JobCreateRequest, request: Request):
             "metrics_output": f"{req.raw_data_path}/metrics",
         }
 
-        new_cluster = {
-            "spark_version": req.spark_version,
-            "node_type_id": req.worker_node_type,
-            "num_workers": req.num_workers,
-            "driver_node_type_id": req.driver_node_type,
-            "runtime_engine": "PHOTON" if req.photon else "STANDARD",
-            "data_security_mode": "SINGLE_USER",
-            "spark_conf": {
-                "spark.databricks.delta.optimizeWrite.enabled": "true",
-            },
-            "gcp_attributes": {
-                "use_preemptible_executors": False,
-                "local_ssd_count": req.local_ssds,
-            },
-        }
+        if req.compute_mode == "serverless":
+            # Serverless: use environment_key instead of new_cluster/job_clusters
+            job_settings = {
+                "name": req.job_name,
+                "tasks": [
+                    {
+                        "task_key": "benchmark_execution",
+                        "environment_key": "Default",
+                        "libraries": [{"jar": jar_path}],
+                        "notebook_task": {
+                            "notebook_path": req.notebook_path or _resolve_notebook_path(w, "benchmark_databricks_notebook"),
+                            "base_parameters": base_parameters,
+                            "source": "WORKSPACE",
+                        },
+                    }
+                ],
+                "timeout_seconds": 0,
+                "max_concurrent_runs": 1,
+            }
+        else:
+            # Classic: provision job cluster with specified node types
+            new_cluster = {
+                "spark_version": req.spark_version,
+                "node_type_id": req.worker_node_type,
+                "num_workers": req.num_workers,
+                "driver_node_type_id": req.driver_node_type,
+                "runtime_engine": "PHOTON" if req.photon else "STANDARD",
+                "data_security_mode": "SINGLE_USER",
+                "spark_conf": {
+                    "spark.databricks.delta.optimizeWrite.enabled": "true",
+                },
+                "gcp_attributes": {
+                    "use_preemptible_executors": False,
+                    "local_ssd_count": req.local_ssds,
+                },
+            }
 
-        job_settings = {
-            "name": req.job_name,
-            "job_clusters": [
-                {
-                    "job_cluster_key": "benchmark_cluster",
-                    "new_cluster": new_cluster,
-                }
-            ],
-            "tasks": [
-                {
-                    "task_key": "benchmark_execution",
-                    "job_cluster_key": "benchmark_cluster",
-                    "libraries": [{"jar": jar_path}],
-                    "notebook_task": {
-                        "notebook_path": req.notebook_path or _resolve_notebook_path(w, "benchmark_databricks_notebook"),
-                        "base_parameters": base_parameters,
-                        "source": "WORKSPACE",
-                    },
-                }
-            ],
-            "timeout_seconds": 0,
-            "max_concurrent_runs": 1,
-        }
+            job_settings = {
+                "name": req.job_name,
+                "job_clusters": [
+                    {
+                        "job_cluster_key": "benchmark_cluster",
+                        "new_cluster": new_cluster,
+                    }
+                ],
+                "tasks": [
+                    {
+                        "task_key": "benchmark_execution",
+                        "job_cluster_key": "benchmark_cluster",
+                        "libraries": [{"jar": jar_path}],
+                        "notebook_task": {
+                            "notebook_path": req.notebook_path or _resolve_notebook_path(w, "benchmark_databricks_notebook"),
+                            "base_parameters": base_parameters,
+                            "source": "WORKSPACE",
+                        },
+                    }
+                ],
+                "timeout_seconds": 0,
+                "max_concurrent_runs": 1,
+            }
 
         if req.job_id:
             # Update existing job via REST API

@@ -143,6 +143,7 @@ class DataprocFullRunRequest(BaseModel):
     target_database: str = "tpcdi_warehouse"
     metrics_output: str = "gs://sumit_prakash_gcs/tpcdi/metrics"
     gcp_refresh_token: str = ""  # Auto-refresh: re-auth before each run
+    compute_mode: str = "classic"  # "classic" or "serverless"
 
 
 # ── Active runs tracker ──────────────────────────────────────────────────
@@ -675,11 +676,13 @@ async def run_full_cycle(req: DataprocFullRunRequest):
         raise HTTPException(status_code=401, detail="Not authenticated with Google Cloud. Please sign in first.")
 
     run_id = _next_run_id()
+    is_serverless = req.compute_mode == "serverless"
     _active_runs[run_id] = {
         "run_id": run_id,
-        "phase": "creating_cluster",
+        "phase": "submitting_batch" if is_serverless else "creating_cluster",
         "state": "RUNNING",
-        "cluster_name": req.cluster_name,
+        "cluster_name": "serverless" if is_serverless else req.cluster_name,
+        "compute_mode": req.compute_mode,
         "job_id": None,
         "error": None,
         "start_time_ms": int(time.time() * 1000),
@@ -691,15 +694,199 @@ async def run_full_cycle(req: DataprocFullRunRequest):
         "duration_ms": None,
         "cost": None,
         "config": {
-            "master_type": req.master_type, "worker_type": req.worker_type,
-            "num_workers": req.num_workers, "ssd_count": req.ssd_count,
+            "master_type": "serverless" if is_serverless else req.master_type,
+            "worker_type": "serverless" if is_serverless else req.worker_type,
+            "num_workers": 0 if is_serverless else req.num_workers,
+            "ssd_count": 0 if is_serverless else req.ssd_count,
             "load_type": req.load_type, "batch_id": req.batch_id,
             "scale_factor": req.scale_factor,
         },
     }
 
-    asyncio.create_task(_run_full_cycle_task(run_id, req))
+    if is_serverless:
+        asyncio.create_task(_run_serverless_batch_task(run_id, req))
+    else:
+        asyncio.create_task(_run_full_cycle_task(run_id, req))
     return {"status": "started", "run_id": run_id}
+
+
+async def _run_serverless_batch_task(run_id: str, req: DataprocFullRunRequest):
+    """Background: submit Dataproc Serverless batch job (no cluster lifecycle)."""
+    import uuid
+    from google.cloud import dataproc_v1
+
+    run = _active_runs[run_id]
+    endpoint = f"{req.region}-dataproc.googleapis.com:443"
+
+    def _fresh_batch_client():
+        creds = get_credentials()
+        if not creds:
+            raise RuntimeError("Google credentials expired or missing")
+        return dataproc_v1.BatchControllerClient(
+            credentials=creds,
+            client_options={"api_endpoint": endpoint},
+        )
+
+    try:
+        creds = get_credentials()
+        if not creds:
+            run["state"] = "ERROR"
+            run["error"] = "Google credentials expired"
+            run["phase"] = "failed"
+            return
+
+        batch_client = _fresh_batch_client()
+
+        # No cluster creation phase — go straight to job submission
+        run["phase"] = "submitting_batch"
+
+        # Build the same script args as classic
+        script_args = [
+            "--load-type", req.load_type,
+            "--scale-factor", str(req.scale_factor),
+            "--format", "delta",
+            f"--gcs-bucket={req.gcs_bucket}",
+            f"--project-id={req.project}",
+            f"--region={req.region}",
+            f"--raw-data-path={req.raw_data_path}",
+            f"--target-database={req.target_database}",
+            "--target-schema=dw",
+            "--save-metrics",
+            f"--metrics-output={req.metrics_output}",
+            "--spark-master=yarn",
+            "--log-detailed-stats",
+        ]
+        if req.batch_id:
+            script_args.extend(["--batch-id", req.batch_id])
+
+        batch = dataproc_v1.Batch(
+            pyspark_batch=dataproc_v1.PySparkBatch(
+                main_python_file_uri=f"gs://{req.gcs_bucket}/tpcdi/dataproc/run_benchmark_dataproc.py",
+                python_file_uris=[f"gs://{req.gcs_bucket}/tpcdi/dataproc/benchmark.zip"],
+                jar_file_uris=[f"gs://{req.gcs_bucket}/tpcdi/libs/spark-xml_2.12-0.18.0.jar"],
+                args=script_args,
+            ),
+            runtime_config=dataproc_v1.RuntimeConfig(
+                version="2.3",
+            ),
+            environment_config=dataproc_v1.EnvironmentConfig(
+                execution_config=dataproc_v1.ExecutionConfig(
+                    subnetwork_uri=f"projects/{req.project}/regions/{req.region}/subnetworks/{req.subnet}",
+                ),
+            ),
+        )
+
+        # Attach metastore if configured
+        if req.metastore:
+            batch.environment_config.peripherals_config = dataproc_v1.PeripheralsConfig(
+                metastore_service=req.metastore,
+            )
+
+        # Generate a unique batch ID
+        batch_id = f"tpcdi-{req.load_type}-sf{req.scale_factor}-{uuid.uuid4().hex[:8]}"
+
+        run["phase"] = "running_job"
+        run["job_submitted_ms"] = int(time.time() * 1000)
+        # For serverless, cluster_created_ms = job_submitted_ms (no separate cluster phase)
+        run["cluster_created_ms"] = run["job_submitted_ms"]
+
+        operation = batch_client.create_batch(
+            request={
+                "parent": f"projects/{req.project}/locations/{req.region}",
+                "batch": batch,
+                "batch_id": batch_id,
+            }
+        )
+
+        run["job_id"] = batch_id
+        run["cluster_name"] = f"serverless-{batch_id}"
+
+        # Poll for completion
+        _last_client_refresh = time.time()
+        _REFRESH_INTERVAL = 30 * 60
+
+        while True:
+            if run_id in _cancelled_runs:
+                try:
+                    batch_client = _fresh_batch_client()
+                except Exception:
+                    pass
+                run["state"] = "CANCELLED"
+                run["phase"] = "cancelled"
+                return
+
+            await asyncio.sleep(15)
+
+            # Refresh client periodically
+            if time.time() - _last_client_refresh > _REFRESH_INTERVAL:
+                try:
+                    batch_client = _fresh_batch_client()
+                    _last_client_refresh = time.time()
+                except Exception as e:
+                    print(f"[dataproc-serverless] WARNING: token refresh failed: {e}")
+
+            try:
+                batch_status = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: batch_client.get_batch(
+                        name=f"projects/{req.project}/locations/{req.region}/batches/{batch_id}"
+                    ),
+                )
+
+                state_name = batch_status.state.name
+                if state_name in ("SUCCEEDED",):
+                    break
+                elif state_name in ("FAILED", "CANCELLED"):
+                    run["state"] = "ERROR"
+                    run["error"] = batch_status.state_message or f"Batch {state_name}"
+                    run["phase"] = "failed"
+                    run["job_done_ms"] = int(time.time() * 1000)
+                    run["cluster_deleted_ms"] = run["job_done_ms"]
+                    total_ms = run["job_done_ms"] - run["start_time_ms"]
+                    run["duration_ms"] = total_ms
+                    return
+            except Exception as poll_err:
+                print(f"[dataproc-serverless] Poll error: {poll_err}")
+
+        run["job_done_ms"] = int(time.time() * 1000)
+        # For serverless, no cluster deletion phase
+        run["cluster_deleted_ms"] = run["job_done_ms"]
+
+        total_ms = run["cluster_deleted_ms"] - run["start_time_ms"]
+        run["duration_ms"] = total_ms
+        run["state"] = "DONE"
+        run["phase"] = "completed"
+
+        # Cost estimation for serverless (DCU-based)
+        hours = total_ms / 3_600_000
+        # Dataproc Serverless pricing: ~$0.065/DCU-hour, estimate ~4 DCUs for typical workload
+        estimated_dcus = 4
+        dcu_cost = estimated_dcus * 0.065 * hours
+        run["cost"] = {
+            "vm_cost_usd": 0,
+            "dataproc_premium_usd": round(dcu_cost, 4),
+            "ssd_cost_usd": 0,
+            "total_cost_usd": round(dcu_cost, 4),
+            "duration_hours": round(hours, 4),
+            "duration_ms": total_ms,
+            "cluster": {
+                "master_type": "serverless",
+                "worker_type": "serverless",
+                "num_workers": 0,
+                "ssd_count": 0,
+            },
+        }
+
+    except Exception as e:
+        run["state"] = "ERROR"
+        run["error"] = str(e)[:500]
+        run["phase"] = "failed"
+        if not run.get("job_done_ms"):
+            run["job_done_ms"] = int(time.time() * 1000)
+        if not run.get("cluster_deleted_ms"):
+            run["cluster_deleted_ms"] = int(time.time() * 1000)
+        if run.get("start_time_ms"):
+            run["duration_ms"] = run["cluster_deleted_ms"] - run["start_time_ms"]
 
 
 async def _run_full_cycle_task(run_id: str, req: DataprocFullRunRequest):

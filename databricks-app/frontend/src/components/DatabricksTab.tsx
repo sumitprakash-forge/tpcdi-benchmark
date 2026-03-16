@@ -700,6 +700,7 @@ export default function DatabricksTab() {
           local_ssds: sizing.ssds,
           log_detailed_stats: true,
           admin_token: adminToken,
+          compute_mode: computeMode,
         }),
       })
       createdJobId = jobResult.job_id
@@ -970,6 +971,7 @@ export default function DatabricksTab() {
           local_ssds: localSsds,
           log_detailed_stats: logDetailedStats,
           admin_token: adminToken,
+          compute_mode: computeMode,
         }),
       })
       createdJobId = jobResult.job_id
