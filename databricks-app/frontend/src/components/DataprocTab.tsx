@@ -308,6 +308,7 @@ export default function DataprocTab() {
           mode: 'e2e',
           flow_type: 'e2e',
           compute_mode: computeMode,
+          serverless_tier: computeMode === 'serverless' ? serverlessTier : undefined,
           scale_factor: e2eSF,
           steps: e2eSteps,
           costs: runCosts,
@@ -316,7 +317,7 @@ export default function DataprocTab() {
         }
       })
     }).catch(() => {})
-  }, [e2eSaveNeeded, e2eSteps, e2eSF, runCosts])
+  }, [e2eSaveNeeded, e2eSteps, e2eSF, runCosts, computeMode, serverlessTier])
 
   // Loading / Toast
   const [toasts, setToasts] = useState<ToastMessage[]>([])

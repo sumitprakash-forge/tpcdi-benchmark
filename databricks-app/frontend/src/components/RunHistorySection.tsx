@@ -43,6 +43,7 @@ interface RunHistoryEntry {
   _filename: string
   status?: string
   compute_mode?: string
+  serverless_tier?: string
   run_id?: string
   batch_run_id?: string
   b2_run_id?: string
@@ -313,9 +314,13 @@ export default function RunHistorySection({ platform }: RunHistorySectionProps) 
                         </td>
                         <td className="px-4 py-2 text-slate-700">
                           <span className={`inline-block px-2 py-0.5 text-[10px] font-semibold rounded ${
-                            entry.compute_mode === 'serverless' ? 'bg-sky-100 text-sky-700' : 'bg-amber-100 text-amber-700'
+                            entry.compute_mode === 'serverless'
+                              ? entry.serverless_tier === 'premium' ? 'bg-amber-100 text-amber-700' : 'bg-sky-100 text-sky-700'
+                              : 'bg-slate-100 text-slate-600'
                           }`}>
-                            {entry.compute_mode === 'serverless' ? 'Serverless' : 'Classic'}
+                            {entry.compute_mode === 'serverless'
+                              ? entry.serverless_tier === 'premium' ? 'Serverless Premium' : 'Serverless Std'
+                              : 'Classic'}
                           </span>
                         </td>
                         <td className="px-4 py-2 text-slate-700">SF {entry.scale_factor}</td>
