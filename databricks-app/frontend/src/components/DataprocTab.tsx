@@ -246,13 +246,46 @@ export default function DataprocTab() {
     localStorage.setItem(E2E_STATE_KEY, JSON.stringify(state))
   }, [e2eSteps, e2eSF, e2eRunId, e2eActiveStep, e2eRunning, runCosts, e2eRemainingSpecs])
 
-  // Detect stale "running" state on mount — if running but no active run ID, reset
-  // On page load: always clear persisted "running" state to prevent stale spinners.
-  // Dataproc runs are in-memory on the server, so after a server restart they're gone anyway.
+  // On mount: check backend for active runs and reconnect, or reset stale state
   useEffect(() => {
-    if (e2eRunning) {
-      setE2eRunning(false)
-    }
+    if (!e2eRunning && !e2eRunId) return // nothing to reconnect
+    let cancelled = false
+    ;(async () => {
+      try {
+        const res = await fetch('/api/dataproc/active-runs')
+        if (!res.ok || cancelled) return
+        const activeRuns: DataprocRunStatus[] = await res.json()
+
+        if (e2eRunId && activeRuns.some(r => r.run_id === e2eRunId)) {
+          // Server still has our run — resume polling (keep state as-is)
+          return
+        }
+
+        // Check if any active run matches our persisted config (reconnect by config)
+        const savedStep = e2eActiveStep
+        if (savedStep !== null && activeRuns.length > 0) {
+          const spec = E2E_RUN_SPECS.find(s => s.stepIndex === savedStep)
+          const match = spec && activeRuns.find(r =>
+            r.config?.load_type === spec.loadType && r.config?.batch_id === spec.batchId && r.state === 'RUNNING'
+          )
+          if (match) {
+            // Found a matching active run — reconnect
+            setE2eRunId(match.run_id)
+            setE2eRunning(true)
+            return
+          }
+        }
+
+        // No active runs on server — reset stale state
+        if (e2eRunning) setE2eRunning(false)
+        if (e2eRunId) setE2eRunId(null)
+      } catch {
+        // Server unreachable — reset to avoid stuck spinner
+        if (e2eRunning) setE2eRunning(false)
+        if (e2eRunId) setE2eRunId(null)
+      }
+    })()
+    return () => { cancelled = true }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []) // Only on mount
 
@@ -447,6 +480,7 @@ export default function DataprocTab() {
   useEffect(() => {
     // Skip polling for the 'pending' sentinel — wait for a real run ID
     if (!e2eRunId || e2eRunId === 'pending' || e2eActiveStep === null) return
+    let failCount = 0
     const stepIdx = e2eActiveStep
     const sf = parseInt(e2eSF)
     const spec = E2E_RUN_SPECS.find(s => s.stepIndex === stepIdx)
@@ -564,7 +598,23 @@ export default function DataprocTab() {
           setE2eRemainingSpecs([])
           return true
         }
-      } catch { /* ignore */ }
+      } catch (e) {
+        failCount++
+        if (failCount >= 5) {
+          updateE2EStep(stepIdx, {
+            status: 'error',
+            output: `${runLabel} | Lost connection to server after ${failCount} retries`,
+          })
+          setE2eRunId(null)
+          setE2eRunning(false)
+          setE2eActiveStep(null)
+          setE2eRemainingSpecs([])
+          return true
+        }
+        updateE2EStep(stepIdx, {
+          output: `${runLabel} | Reconnecting... (attempt ${failCount}/5)`,
+        })
+      }
       return false
     }
 
@@ -573,7 +623,16 @@ export default function DataprocTab() {
       const done = await poll()
       if (done) clearInterval(interval)
     }, 10000)
-    return () => clearInterval(interval)
+
+    // Resume polling immediately when tab becomes visible again
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') poll()
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      clearInterval(interval)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
   }, [e2eRunId, e2eActiveStep])
 
   // Auto-continue: when e2eNextSpec is set, start the next run
@@ -741,6 +800,7 @@ export default function DataprocTab() {
   // Polling useEffect for manual pipeline run
   useEffect(() => {
     if (!manualRunId || manualRunId === 'pending' || manualActiveStep === null) return
+    let failCount = 0
     const stepIdx = manualActiveStep
     const spec = MANUAL_PIPELINE_SPECS[stepIdx]
     const label = spec?.label || `Step ${stepIdx + 1}`
@@ -838,7 +898,23 @@ export default function DataprocTab() {
           setManualRemainingSpecs([])
           return true
         }
-      } catch { /* ignore */ }
+      } catch (e) {
+        failCount++
+        if (failCount >= 5) {
+          updateManualStep(stepIdx, {
+            status: 'error',
+            output: `${label} | Lost connection to server after ${failCount} retries`,
+          })
+          setManualRunId(null)
+          setManualPipelineRunning(false)
+          setManualActiveStep(null)
+          setManualRemainingSpecs([])
+          return true
+        }
+        updateManualStep(stepIdx, {
+          output: `${label} | Reconnecting... (attempt ${failCount}/5)`,
+        })
+      }
       return false
     }
 
@@ -847,7 +923,16 @@ export default function DataprocTab() {
       const done = await poll()
       if (done) clearInterval(interval)
     }, 10000)
-    return () => clearInterval(interval)
+
+    // Resume polling immediately when tab becomes visible again
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') poll()
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      clearInterval(interval)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
   }, [manualRunId, manualActiveStep])
 
   // Auto-continue: when a manual pipeline step completes, start next spec

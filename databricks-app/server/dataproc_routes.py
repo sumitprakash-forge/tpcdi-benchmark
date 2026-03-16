@@ -968,6 +968,15 @@ async def _cleanup_cluster_api(cluster_client, req, run: dict | None = None):
             run["cluster_delete_error"] = err_msg
 
 
+@router.get("/dataproc/active-runs")
+async def get_active_runs():
+    """Return all runs that are still in RUNNING state (for UI reconnection after page reload)."""
+    return [
+        run for run in _active_runs.values()
+        if run.get("state") == "RUNNING"
+    ]
+
+
 @router.get("/dataproc/run-status/{run_id}")
 async def get_run_status(run_id: str):
     if run_id not in _active_runs:
