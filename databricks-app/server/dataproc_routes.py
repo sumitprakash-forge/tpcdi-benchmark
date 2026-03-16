@@ -993,11 +993,12 @@ async def _run_serverless_batch_task(run_id: str, req: DataprocFullRunRequest):
 
         total_ms = run["cluster_deleted_ms"] - run["start_time_ms"]
         run["duration_ms"] = total_ms
-        run["state"] = "DONE"
-        run["phase"] = "completed"
+        run["phase"] = "calculating_cost"
         _persist_runs()
 
         # Cost from actual DCU usage reported by Dataproc Serverless
+        # IMPORTANT: set state=DONE only AFTER cost is calculated,
+        # otherwise frontend sees DONE with cost=null and moves on
         # Usage metrics may take ~30s to populate after batch completes — retry
         DCU_PRICE_PER_HOUR = 0.065
         SHUFFLE_STORAGE_PRICE_PER_GB_HOUR = 0.000054
@@ -1052,6 +1053,9 @@ async def _run_serverless_batch_task(run_id: str, req: DataprocFullRunRequest):
                 "ssd_count": 0,
             },
         }
+        # NOW mark as DONE — cost is populated, frontend can safely read it
+        run["state"] = "DONE"
+        run["phase"] = "completed"
         _persist_runs()
 
     except Exception as e:
