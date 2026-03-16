@@ -48,6 +48,7 @@ interface DataprocRunStatus {
   phase: string
   state: string
   cluster_name: string
+  compute_mode?: string
   job_id: string | null
   error: string | null
   start_time_ms: number | null
@@ -524,10 +525,13 @@ export default function DataprocTab() {
           parts.push(`Total: ${formatDuration(elapsed)}`)
         }
 
-        // Build GCP Console link for the Dataproc job
-        const gcpLink = status.job_id && status.config
-          ? `https://console.cloud.google.com/dataproc/jobs/${status.job_id}?project=${project}&region=${region}`
-          : status.cluster_name
+        // Build GCP Console link — batches for serverless, jobs for classic
+        const isServerless = status.compute_mode === 'serverless' || computeMode === 'serverless'
+        const gcpLink = status.job_id
+          ? isServerless
+            ? `https://console.cloud.google.com/dataproc/batches/${status.job_id}/monitoring?project=${project}&region=${region}`
+            : `https://console.cloud.google.com/dataproc/jobs/${status.job_id}?project=${project}&region=${region}`
+          : status.cluster_name && !isServerless
             ? `https://console.cloud.google.com/dataproc/clusters/${status.cluster_name}?project=${project}&region=${region}`
             : undefined
 
@@ -555,7 +559,9 @@ export default function DataprocTab() {
           }
 
           const doneLink = status.job_id
-            ? `https://console.cloud.google.com/dataproc/jobs/${status.job_id}?project=${project}&region=${region}`
+            ? isServerless
+              ? `https://console.cloud.google.com/dataproc/batches/${status.job_id}/monitoring?project=${project}&region=${region}`
+              : `https://console.cloud.google.com/dataproc/jobs/${status.job_id}?project=${project}&region=${region}`
             : undefined
 
           updateE2EStep(stepIdx, {
@@ -844,9 +850,12 @@ export default function DataprocTab() {
           parts.push(`Total: ${formatDuration(elapsed)}`)
         }
 
-        const gcpLink = status.job_id && status.config
-          ? `https://console.cloud.google.com/dataproc/jobs/${status.job_id}?project=${project}&region=${region}`
-          : status.cluster_name
+        const isServerlessManual = status.compute_mode === 'serverless' || computeMode === 'serverless'
+        const gcpLink = status.job_id
+          ? isServerlessManual
+            ? `https://console.cloud.google.com/dataproc/batches/${status.job_id}/monitoring?project=${project}&region=${region}`
+            : `https://console.cloud.google.com/dataproc/jobs/${status.job_id}?project=${project}&region=${region}`
+          : status.cluster_name && !isServerlessManual
             ? `https://console.cloud.google.com/dataproc/clusters/${status.cluster_name}?project=${project}&region=${region}`
             : undefined
 
@@ -873,7 +882,9 @@ export default function DataprocTab() {
           }
 
           const doneLink = status.job_id
-            ? `https://console.cloud.google.com/dataproc/jobs/${status.job_id}?project=${project}&region=${region}`
+            ? isServerlessManual
+              ? `https://console.cloud.google.com/dataproc/batches/${status.job_id}/monitoring?project=${project}&region=${region}`
+              : `https://console.cloud.google.com/dataproc/jobs/${status.job_id}?project=${project}&region=${region}`
             : undefined
 
           updateManualStep(stepIdx, {

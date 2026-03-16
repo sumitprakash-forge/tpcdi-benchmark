@@ -1019,7 +1019,6 @@ async def _run_full_cycle_task(run_id: str, req: DataprocFullRunRequest):
             "--target-schema=dw",
             "--save-metrics",
             f"--metrics-output={req.metrics_output}",
-            "--spark-master=yarn",
             "--log-detailed-stats",
         ]
         if req.batch_id:
