@@ -311,8 +311,8 @@ export default function DataprocTab() {
           platform: 'dataproc',
           mode: 'e2e',
           flow_type: 'e2e',
-          compute_mode: computeMode,
-          serverless_tier: computeMode === 'serverless' ? serverlessTier : undefined,
+          compute_mode: e2eLockedComputeMode.current,
+          serverless_tier: e2eLockedComputeMode.current === 'serverless' ? e2eLockedServerlessTier.current : undefined,
           scale_factor: e2eSF,
           steps: e2eSteps,
           costs: runCosts,
@@ -432,11 +432,14 @@ export default function DataprocTab() {
   }
 
   const e2eCancelledRef = useRef(false)
+  // Lock compute mode at pipeline start so UI changes don't affect running pipeline
+  const e2eLockedComputeMode = useRef<ComputeMode>('classic')
+  const e2eLockedServerlessTier = useRef<'standard' | 'premium'>('standard')
   const [e2eNextSpec, setE2eNextSpec] = useState<E2ERunSpec | null>(null)
 
   function buildRunLabel(spec: E2ERunSpec, sf: number): string {
-    const isServerless = computeModeRef.current === 'serverless'
-    const tierLabel = serverlessTierRef.current === 'premium' ? 'Premium' : 'Standard'
+    const isServerless = e2eLockedComputeMode.current === 'serverless'
+    const tierLabel = e2eLockedServerlessTier.current === 'premium' ? 'Premium' : 'Standard'
     const clusterInfo = isServerless
       ? `Serverless ${tierLabel}`
       : (() => { const s = getDataprocSizing(sf, spec.loadType); return `${s.worker} x${s.workers}, ${s.ssds} SSDs` })()
@@ -478,8 +481,8 @@ export default function DataprocTab() {
           target_database: targetDatabase,
           metrics_output: metricsOutput,
           gcp_refresh_token: gcpRefreshToken.trim(),
-          compute_mode: computeModeRef.current,
-          serverless_tier: serverlessTierRef.current,
+          compute_mode: e2eLockedComputeMode.current,
+          serverless_tier: e2eLockedServerlessTier.current,
         }),
       })
       setE2eRunId(result.run_id)
@@ -672,6 +675,10 @@ export default function DataprocTab() {
 
   // Main E2E handler
   async function handleRunE2E() {
+    // Lock compute mode for the entire pipeline run — UI changes won't affect it
+    e2eLockedComputeMode.current = computeMode
+    e2eLockedServerlessTier.current = serverlessTier
+
     const steps = buildE2ESteps(e2eSF)
     setE2eSteps(steps)
     setE2eRunning(true)
