@@ -435,10 +435,14 @@ export default function DataprocTab() {
   const [e2eNextSpec, setE2eNextSpec] = useState<E2ERunSpec | null>(null)
 
   function buildRunLabel(spec: E2ERunSpec, sf: number): string {
-    const sizing = getDataprocSizing(sf, spec.loadType)
+    const isServerless = computeModeRef.current === 'serverless'
+    const tierLabel = serverlessTierRef.current === 'premium' ? 'Premium' : 'Standard'
+    const clusterInfo = isServerless
+      ? `Serverless ${tierLabel}`
+      : (() => { const s = getDataprocSizing(sf, spec.loadType); return `${s.worker} x${s.workers}, ${s.ssds} SSDs` })()
     return spec.loadType === 'batch'
-      ? `SF ${sf} | Batch | ${sizing.worker} x${sizing.workers}, ${sizing.ssds} SSDs`
-      : `SF ${sf} | Incremental Batch ${spec.batchId} | ${sizing.worker} x${sizing.workers}, ${sizing.ssds} SSDs`
+      ? `SF ${sf} | Batch | ${clusterInfo}`
+      : `SF ${sf} | Incremental Batch ${spec.batchId} | ${clusterInfo}`
   }
 
   async function startE2ERunSpec(spec: E2ERunSpec) {
