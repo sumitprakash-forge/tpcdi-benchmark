@@ -1134,8 +1134,13 @@ export default function DataprocTab() {
             )}
           </div>
           <p className="text-[11px] text-slate-500">
-            Auto-refreshes before every run. Get it from: <code className="bg-slate-100 px-1 rounded text-[10px]">cat ~/.config/gcloud/application_default_credentials.json</code> (copy the <code className="bg-slate-100 px-1 rounded text-[10px]">refresh_token</code> field)
+            Auto-refreshes before every run. To get the token:
           </p>
+          <ol className="text-[11px] text-slate-500 mt-1 ml-3 list-decimal space-y-0.5">
+            <li>Run <code className="bg-slate-100 px-1 rounded text-[10px]">gcloud auth application-default login</code> (creates credentials file if it doesn't exist)</li>
+            <li>Run <code className="bg-slate-100 px-1 rounded text-[10px]">cat ~/.config/gcloud/application_default_credentials.json</code></li>
+            <li>Copy the <code className="bg-slate-100 px-1 rounded text-[10px]">refresh_token</code> field value and paste it below</li>
+          </ol>
         </div>
         <div className="flex items-center gap-3">
           <div className="flex-1 relative">

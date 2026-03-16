@@ -8,13 +8,33 @@ interface RunHistoryStep {
   link?: string
 }
 
+interface RunHistoryCost {
+  vm_cost_usd?: number
+  dataproc_premium_usd?: number
+  ssd_cost_usd?: number
+  total_cost_usd?: number
+  duration_ms?: number
+  duration_hours?: number
+  cluster?: {
+    master_type?: string
+    worker_type?: string
+    worker_node_type?: string
+    driver_node_type?: string
+    driver_type?: string
+    num_workers?: number
+    ssd_count?: number
+    local_ssd_count?: number
+  }
+  [key: string]: any
+}
+
 interface RunHistoryEntry {
   platform: string
   mode: string
   flow_type?: string
   scale_factor: string | number
   steps: RunHistoryStep[]
-  costs: (null | { total_cost_usd?: number; [key: string]: any })[]
+  costs: (null | RunHistoryCost)[]
   completed_at: string
   saved_at: string
   user_email?: string
@@ -40,6 +60,56 @@ function formatDurationMs(ms: number | undefined | null): string {
   const hrs = Math.floor(mins / 60)
   const rm = mins % 60
   return `${hrs}h ${rm}m`
+}
+
+/** Parse duration breakdown from step output string.
+ * Dataproc: "Cluster: Xm Ys" and "Job: Xm Ys"
+ * Databricks: "Setup: Xm Ys" and "Exec: Xm Ys"  */
+function parseDurationBreakdown(output: string | undefined): { setup: string; exec: string } | null {
+  if (!output) return null
+  // Dataproc format
+  const clusterMatch = output.match(/Cluster:\s*([^|,]+)/)
+  const jobMatch = output.match(/Job:\s*([^|,]+)/)
+  if (clusterMatch || jobMatch) {
+    return {
+      setup: clusterMatch ? clusterMatch[1].trim() : '--',
+      exec: jobMatch ? jobMatch[1].trim() : '--',
+    }
+  }
+  // Databricks format
+  const setupMatch = output.match(/Setup:\s*([^|,]+)/)
+  const execMatch = output.match(/Exec:\s*([^|,]+)/)
+  if (setupMatch || execMatch) {
+    return {
+      setup: setupMatch ? setupMatch[1].trim() : '--',
+      exec: execMatch ? execMatch[1].trim() : '--',
+    }
+  }
+  return null
+}
+
+/**
+ * Map step index to cost index.
+ * Steps array: [0: prereq, 1: batch, 2: inc-b2, 3: inc-b3]
+ * Costs array: [0: batch, 1: inc-b2, 2: inc-b3]
+ * So cost for step si is costs[si - 1] for si >= 1, null for si === 0.
+ */
+function getCostForStep(entry: RunHistoryEntry, stepIndex: number): RunHistoryCost | null {
+  if (!entry.costs) return null
+  // Prereq/check steps have no cost
+  const stepName = (entry.steps?.[stepIndex]?.name || '').toLowerCase()
+  if (stepName.includes('prereq') || stepName.includes('check') || stepName.includes('gcloud') || stepName.includes('network')) {
+    return null
+  }
+  // Count how many non-prereq steps came before this one to find the cost index
+  let costIdx = 0
+  for (let i = 0; i < stepIndex; i++) {
+    const name = (entry.steps?.[i]?.name || '').toLowerCase()
+    if (!name.includes('prereq') && !name.includes('check') && !name.includes('gcloud') && !name.includes('network')) {
+      costIdx++
+    }
+  }
+  return entry.costs[costIdx] || null
 }
 
 interface RunHistorySectionProps {
@@ -293,14 +363,17 @@ export default function RunHistorySection({ platform }: RunHistorySectionProps) 
                                 <tr className="text-left text-slate-400 uppercase tracking-wide">
                                   <th className="pb-2 pr-4">Step</th>
                                   <th className="pb-2 pr-4">Status</th>
-                                  <th className="pb-2 pr-4">Duration</th>
-                                  <th className="pb-2 pr-4">Cost</th>
+                                  <th className="pb-2 pr-4">Cluster Config</th>
+                                  <th className="pb-2 pr-4">Duration (Setup + Exec = Total)</th>
+                                  <th className="pb-2 pr-4">Cost (Compute + DBU + SSD = Total)</th>
                                   <th className="pb-2">Link</th>
                                 </tr>
                               </thead>
                               <tbody className="text-slate-700">
                                 {entry.steps.map((step, si) => {
-                                  const stepCost = entry.costs?.[si]
+                                  const stepCost = getCostForStep(entry, si)
+                                  const durBreakdown = parseDurationBreakdown(step.output)
+                                  const cluster = stepCost?.cluster
                                   return (
                                     <tr key={si} className="border-t border-slate-100">
                                       <td className="py-1.5 pr-4 font-medium">{step.name}</td>
@@ -310,9 +383,50 @@ export default function RunHistorySection({ platform }: RunHistorySectionProps) 
                                           {step.status}
                                         </span>
                                       </td>
-                                      <td className="py-1.5 pr-4 font-mono">{formatDurationMs(step.duration_ms)}</td>
+                                      <td className="py-1.5 pr-4 text-[10px] text-slate-500">
+                                        {cluster ? (
+                                          <div className="leading-tight">
+                                            {platform === 'dataproc' ? (
+                                              <>
+                                                <div>M: {cluster.master_type || '--'}</div>
+                                                <div>W: {cluster.worker_type || '--'} x{cluster.num_workers ?? '--'}</div>
+                                                {(cluster.ssd_count != null && cluster.ssd_count > 0) && <div>SSD: {cluster.ssd_count}/node</div>}
+                                              </>
+                                            ) : (
+                                              <>
+                                                <div>D: {cluster.driver_node_type || cluster.driver_type || '--'}</div>
+                                                <div>W: {cluster.worker_node_type || cluster.worker_type || '--'} x{cluster.num_workers ?? '--'}</div>
+                                                {(cluster.local_ssd_count != null && cluster.local_ssd_count > 0) && <div>SSD: {cluster.local_ssd_count}/node</div>}
+                                              </>
+                                            )}
+                                          </div>
+                                        ) : '--'}
+                                      </td>
                                       <td className="py-1.5 pr-4 font-mono">
-                                        {stepCost?.total_cost_usd != null ? `$${stepCost.total_cost_usd.toFixed(2)}` : '--'}
+                                        {durBreakdown ? (
+                                          <span>
+                                            <span className="text-slate-500">{durBreakdown.setup}</span>
+                                            {' + '}
+                                            <span className="text-slate-500">{durBreakdown.exec}</span>
+                                            {' = '}
+                                            <span className="font-medium">{formatDurationMs(step.duration_ms)}</span>
+                                          </span>
+                                        ) : (
+                                          formatDurationMs(step.duration_ms)
+                                        )}
+                                      </td>
+                                      <td className="py-1.5 pr-4 font-mono">
+                                        {stepCost?.total_cost_usd != null ? (
+                                          <span>
+                                            <span className="text-slate-500">${stepCost.vm_cost_usd?.toFixed(2) ?? '0.00'}</span>
+                                            {' + '}
+                                            <span className="text-slate-500">${stepCost.dbu_cost_usd?.toFixed(2) ?? stepCost.dataproc_premium_usd?.toFixed(2) ?? '0.00'}</span>
+                                            {' + '}
+                                            <span className="text-slate-500">${stepCost.ssd_cost_usd?.toFixed(2) ?? '0.00'}</span>
+                                            {' = '}
+                                            <span className="font-medium">${stepCost.total_cost_usd.toFixed(2)}</span>
+                                          </span>
+                                        ) : '--'}
                                       </td>
                                       <td className="py-1.5">
                                         {step.link ? (
