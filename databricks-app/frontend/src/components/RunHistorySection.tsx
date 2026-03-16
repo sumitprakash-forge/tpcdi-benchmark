@@ -42,6 +42,7 @@ interface RunHistoryEntry {
   run_by_email?: string
   _filename: string
   status?: string
+  compute_mode?: string
   run_id?: string
   batch_run_id?: string
   b2_run_id?: string
@@ -270,6 +271,7 @@ export default function RunHistorySection({ platform }: RunHistorySectionProps) 
                 <tr className="bg-slate-50 text-left text-slate-500 uppercase tracking-wide">
                   <th className="px-4 py-2 w-8"></th>
                   <th className="px-4 py-2">Flow</th>
+                  <th className="px-4 py-2">Compute</th>
                   <th className="px-4 py-2">Scale Factor</th>
                   <th className="px-4 py-2">Run By</th>
                   <th className="px-4 py-2">Status</th>
@@ -307,6 +309,13 @@ export default function RunHistorySection({ platform }: RunHistorySectionProps) 
                             (entry.flow_type || entry.mode) === 'e2e' ? 'bg-purple-100 text-purple-700' : 'bg-slate-100 text-slate-600'
                           }`}>
                             {(entry.flow_type || entry.mode || 'e2e').toUpperCase()}
+                          </span>
+                        </td>
+                        <td className="px-4 py-2 text-slate-700">
+                          <span className={`inline-block px-2 py-0.5 text-[10px] font-semibold rounded ${
+                            entry.compute_mode === 'serverless' ? 'bg-sky-100 text-sky-700' : 'bg-amber-100 text-amber-700'
+                          }`}>
+                            {entry.compute_mode === 'serverless' ? 'Serverless' : 'Classic'}
                           </span>
                         </td>
                         <td className="px-4 py-2 text-slate-700">SF {entry.scale_factor}</td>
@@ -357,7 +366,7 @@ export default function RunHistorySection({ platform }: RunHistorySectionProps) 
 
                       {isExpanded && entry.steps && (
                         <tr className="bg-slate-50">
-                          <td colSpan={11} className="px-6 py-4">
+                          <td colSpan={12} className="px-6 py-4">
                             <table className="w-full text-xs">
                               <thead>
                                 <tr className="text-left text-slate-400 uppercase tracking-wide">

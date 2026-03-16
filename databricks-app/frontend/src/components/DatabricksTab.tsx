@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import Section from './Section'
 import ActionButton from './ActionButton'
 import FormField, { TextInput, NumberInput, SelectInput, Checkbox } from './FormField'
+import ComputeModeSelector, { type ComputeMode } from './ComputeModeSelector'
 import Toast from './Toast'
 import RunHistorySection from './RunHistorySection'
 
@@ -257,6 +258,7 @@ export default function DatabricksTab() {
   const [targetCatalog, setTargetCatalog] = useState('gcp_tpcdi_sandbox')
   const [targetSchema, setTargetSchema] = useState('dw')
   const [_batchId, _setBatchId] = useState('')
+  const [computeMode, setComputeMode] = useState<ComputeMode>('classic')
   const [cloud, setCloud] = useState('GCP')
   const [xmlFormat, setXmlFormat] = useState('com.databricks.spark.xml')
   const [sparkVersion, setSparkVersion] = useState('17.3.x-scala2.13')
@@ -418,6 +420,7 @@ export default function DatabricksTab() {
           platform: 'databricks',
           mode: 'e2e',
           flow_type: 'e2e',
+          compute_mode: computeMode,
           scale_factor: e2eSF,
           steps: e2eSteps,
           costs: runCosts,
@@ -444,6 +447,7 @@ export default function DatabricksTab() {
           platform: 'databricks',
           mode: 'manual',
           flow_type: 'manual',
+          compute_mode: computeMode,
           scale_factor: scaleFactor,
           steps: manualSteps,
           costs: manualCosts,
@@ -1206,6 +1210,11 @@ export default function DatabricksTab() {
         </button>
       </div>
 
+      {/* Compute Mode Selector — applies to both E2E and Manual */}
+      <div className="mb-6">
+        <ComputeModeSelector mode={computeMode} onChange={setComputeMode} platform="databricks" />
+      </div>
+
       {/* ── End-to-End Mode ─────────────────────────────────────────── */}
       {mode === 'e2e' && (
         <Section title="End-to-End Benchmark Run" defaultOpen={true} colorScheme="blue">
@@ -1616,25 +1625,39 @@ export default function DatabricksTab() {
               ]}
             />
           </FormField>
-          <FormField label="Worker Node Type">
-            <SelectInput value={workerNodeType} onChange={setWorkerNodeType} options={gcpNodeTypes} />
-          </FormField>
-          <FormField label="Driver Node Type">
-            <SelectInput value={driverNodeType} onChange={setDriverNodeType} options={gcpNodeTypes} />
-          </FormField>
-          <FormField label="Number of Workers">
-            <NumberInput value={numWorkers} onChange={setNumWorkers} min={1} max={100} />
-          </FormField>
-          <FormField label="Local SSDs per Node">
-            <NumberInput value={localSsds} onChange={setLocalSsds} min={0} max={8} />
-          </FormField>
+          {computeMode === 'classic' && (
+            <>
+              <FormField label="Worker Node Type">
+                <SelectInput value={workerNodeType} onChange={setWorkerNodeType} options={gcpNodeTypes} />
+              </FormField>
+              <FormField label="Driver Node Type">
+                <SelectInput value={driverNodeType} onChange={setDriverNodeType} options={gcpNodeTypes} />
+              </FormField>
+              <FormField label="Number of Workers">
+                <NumberInput value={numWorkers} onChange={setNumWorkers} min={1} max={100} />
+              </FormField>
+              <FormField label="Local SSDs per Node">
+                <NumberInput value={localSsds} onChange={setLocalSsds} min={0} max={8} />
+              </FormField>
+            </>
+          )}
+          {computeMode === 'serverless' && (
+            <div className="lg:col-span-3">
+              <div className="flex items-center gap-2 px-4 py-3 bg-purple-50 border border-purple-200 rounded-lg text-sm text-purple-700">
+                <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+                Serverless compute auto-manages cluster resources. No node type or worker count configuration needed.
+              </div>
+            </div>
+          )}
           <div className="lg:col-span-3">
             <FormField label="JAR Library Path" hint={`Default: ${effectiveJarPath}`}>
               <TextInput value={jarPath} onChange={setJarPath} placeholder={effectiveJarPath} />
             </FormField>
           </div>
           <div className="flex gap-6">
-            <Checkbox checked={photon} onChange={setPhoton} label="Photon Enabled" />
+            {computeMode === 'classic' && <Checkbox checked={photon} onChange={setPhoton} label="Photon Enabled" />}
             <Checkbox checked={logDetailedStats} onChange={setLogDetailedStats} label="Log Detailed Stats" />
           </div>
         </div>

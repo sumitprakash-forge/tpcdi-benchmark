@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import Section from './Section'
 import ActionButton from './ActionButton'
 import FormField, { TextInput, NumberInput, SelectInput } from './FormField'
+import ComputeModeSelector, { type ComputeMode } from './ComputeModeSelector'
 import Toast from './Toast'
 import RunHistorySection from './RunHistorySection'
 
@@ -138,6 +139,7 @@ function buildE2ESteps(sf: string): E2EStep[] {
 
 export default function DataprocTab() {
   const [mode, setMode] = useState<'e2e' | 'manual'>('e2e')
+  const [computeMode, setComputeMode] = useState<ComputeMode>('classic')
 
   // Common config
   const [project, setProject] = useState('gcp-sandbox-field-eng')
@@ -303,6 +305,7 @@ export default function DataprocTab() {
           platform: 'dataproc',
           mode: 'e2e',
           flow_type: 'e2e',
+          compute_mode: computeMode,
           scale_factor: e2eSF,
           steps: e2eSteps,
           costs: runCosts,
@@ -1210,6 +1213,7 @@ export default function DataprocTab() {
       {mode === 'e2e' && (
         <Section title="End-to-End Dataproc Benchmark" defaultOpen={true} colorScheme="blue">
           <div className="pt-4">
+            <ComputeModeSelector mode={computeMode} onChange={setComputeMode} platform="dataproc" />
             {/* Config Row */}
             <div className="flex flex-wrap items-end gap-4 mb-6">
               <FormField label="Scale Factor">
@@ -1751,24 +1755,35 @@ export default function DataprocTab() {
                 {isExpanded && !manualPipelineRunning && (
                   <div className="px-4 pb-4 pt-0">
                     <div className="ml-10 p-3 bg-white rounded-lg border border-slate-200">
-                      <p className="text-[10px] text-slate-500 uppercase font-semibold mb-2">Cluster Configuration</p>
-                      <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-                        <FormField label="Cluster Name">
-                          <TextInput value={cfg.clusterName} onChange={(v) => updateStepConfig(i, { clusterName: v })} placeholder="cluster-name" />
-                        </FormField>
-                        <FormField label="Master Type">
-                          <SelectInput value={cfg.masterType} onChange={(v) => updateStepConfig(i, { masterType: v })} options={gcpNodeTypes} />
-                        </FormField>
-                        <FormField label="Worker Type">
-                          <SelectInput value={cfg.workerType} onChange={(v) => updateStepConfig(i, { workerType: v })} options={gcpNodeTypes} />
-                        </FormField>
-                        <FormField label="Workers">
-                          <NumberInput value={cfg.numWorkers} onChange={(v) => updateStepConfig(i, { numWorkers: v })} min={1} max={100} />
-                        </FormField>
-                        <FormField label="SSDs per Node">
-                          <NumberInput value={cfg.ssdCount} onChange={(v) => updateStepConfig(i, { ssdCount: v })} min={0} max={8} />
-                        </FormField>
-                      </div>
+                      {computeMode === 'classic' ? (
+                        <>
+                          <p className="text-[10px] text-slate-500 uppercase font-semibold mb-2">Cluster Configuration</p>
+                          <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+                            <FormField label="Cluster Name">
+                              <TextInput value={cfg.clusterName} onChange={(v) => updateStepConfig(i, { clusterName: v })} placeholder="cluster-name" />
+                            </FormField>
+                            <FormField label="Master Type">
+                              <SelectInput value={cfg.masterType} onChange={(v) => updateStepConfig(i, { masterType: v })} options={gcpNodeTypes} />
+                            </FormField>
+                            <FormField label="Worker Type">
+                              <SelectInput value={cfg.workerType} onChange={(v) => updateStepConfig(i, { workerType: v })} options={gcpNodeTypes} />
+                            </FormField>
+                            <FormField label="Workers">
+                              <NumberInput value={cfg.numWorkers} onChange={(v) => updateStepConfig(i, { numWorkers: v })} min={1} max={100} />
+                            </FormField>
+                            <FormField label="SSDs per Node">
+                              <NumberInput value={cfg.ssdCount} onChange={(v) => updateStepConfig(i, { ssdCount: v })} min={0} max={8} />
+                            </FormField>
+                          </div>
+                        </>
+                      ) : (
+                        <div className="flex items-center gap-2 px-3 py-2.5 bg-purple-50 border border-purple-200 rounded-lg text-sm text-purple-700">
+                          <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                          </svg>
+                          Serverless Batch mode — Dataproc auto-manages compute resources. No cluster config needed.
+                        </div>
+                      )}
                     </div>
                   </div>
                 )}
