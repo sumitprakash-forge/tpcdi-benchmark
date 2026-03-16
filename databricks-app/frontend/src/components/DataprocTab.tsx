@@ -141,7 +141,11 @@ function buildE2ESteps(sf: string): E2EStep[] {
 export default function DataprocTab() {
   const [mode, setMode] = useState<'e2e' | 'manual'>('e2e')
   const [computeMode, setComputeMode] = useState<ComputeMode>('classic')
+  const computeModeRef = useRef(computeMode)
+  computeModeRef.current = computeMode
   const [serverlessTier, setServerlessTier] = useState<'standard' | 'premium'>('standard')
+  const serverlessTierRef = useRef(serverlessTier)
+  serverlessTierRef.current = serverlessTier
 
   // Common config
   const [project, setProject] = useState('gcp-sandbox-field-eng')
@@ -470,8 +474,8 @@ export default function DataprocTab() {
           target_database: targetDatabase,
           metrics_output: metricsOutput,
           gcp_refresh_token: gcpRefreshToken.trim(),
-          compute_mode: computeMode,
-          serverless_tier: serverlessTier,
+          compute_mode: computeModeRef.current,
+          serverless_tier: serverlessTierRef.current,
         }),
       })
       setE2eRunId(result.run_id)
