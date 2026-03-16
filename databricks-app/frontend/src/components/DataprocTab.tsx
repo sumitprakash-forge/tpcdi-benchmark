@@ -528,12 +528,19 @@ export default function DataprocTab() {
     const poll = async () => {
       try {
         const status: DataprocRunStatus = await apiCall(`/api/dataproc/run-status/${e2eRunId}`)
+
+        // Sync locked compute mode from backend (handles new browser / incognito)
+        if (status.compute_mode) {
+          e2eLockedComputeMode.current = status.compute_mode as ComputeMode
+        }
+
         const elapsed = status.start_time_ms
           ? Date.now() - status.start_time_ms
           : null
 
-        // Build detailed status line
-        const parts: string[] = [runLabel]
+        // Rebuild run label with synced compute mode
+        const currentRunLabel = spec ? buildRunLabel(spec, sf) : `Step ${stepIdx}`
+        const parts: string[] = [currentRunLabel]
         parts.push(`Phase: ${phaseIcon(status.phase)}`)
         if (status.cluster_created_ms && status.start_time_ms) {
           parts.push(`Cluster: ${formatDuration(status.cluster_created_ms - status.start_time_ms)}`)
@@ -569,7 +576,7 @@ export default function DataprocTab() {
           if (stepDone) return true  // already handled by concurrent poll
           stepDone = true
           // Build completion summary with timing breakdown
-          const timingParts: string[] = [runLabel, 'Done']
+          const timingParts: string[] = [currentRunLabel, 'Done']
           if (status.cluster_created_ms && status.start_time_ms) {
             timingParts.push(`Cluster: ${formatDuration(status.cluster_created_ms - status.start_time_ms)}`)
           }
@@ -628,7 +635,7 @@ export default function DataprocTab() {
           stepDone = true
           updateE2EStep(stepIdx, {
             status: 'error',
-            output: `${runLabel} | ${status.state}: ${status.error || 'Unknown error'}`,
+            output: `${currentRunLabel} | ${status.state}: ${status.error || 'Unknown error'}`,
             duration_ms: elapsed,
           })
           setE2eRunId(null)
