@@ -156,7 +156,9 @@ if __name__ == "__main__":
     parser.add_argument("--batch-id", type=int,
                        help="Batch ID for incremental loads (required for incremental)")
     parser.add_argument("--spark-master", default="yarn",
-                       help="Spark master URL (default: yarn). For serverless batches, pass --spark-master= to leave master unset.")
+                       help="Spark master URL (default: yarn). For serverless batches, use --no-spark-master.")
+    parser.add_argument("--no-spark-master", dest="spark_master", action="store_const", const="",
+                       help="Disable spark master (for Dataproc Serverless batches)")
     parser.add_argument("--service-account-email",
                        help="Service account email for GCS access (optional)")
     parser.add_argument("--service-account-key-file",
