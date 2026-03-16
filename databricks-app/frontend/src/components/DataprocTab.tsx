@@ -141,6 +141,7 @@ function buildE2ESteps(sf: string): E2EStep[] {
 export default function DataprocTab() {
   const [mode, setMode] = useState<'e2e' | 'manual'>('e2e')
   const [computeMode, setComputeMode] = useState<ComputeMode>('classic')
+  const [serverlessTier, setServerlessTier] = useState<'standard' | 'premium'>('standard')
 
   // Common config
   const [project, setProject] = useState('gcp-sandbox-field-eng')
@@ -469,6 +470,7 @@ export default function DataprocTab() {
           metrics_output: metricsOutput,
           gcp_refresh_token: gcpRefreshToken.trim(),
           compute_mode: computeMode,
+          serverless_tier: serverlessTier,
         }),
       })
       setE2eRunId(result.run_id)
@@ -797,6 +799,7 @@ export default function DataprocTab() {
           metrics_output: metricsOutput,
           gcp_refresh_token: gcpRefreshToken.trim(),
           compute_mode: computeMode,
+          serverless_tier: serverlessTier,
         }),
       })
       setManualRunId(result.run_id)
@@ -1229,6 +1232,35 @@ export default function DataprocTab() {
         <Section title="End-to-End Dataproc Benchmark" defaultOpen={true} colorScheme="blue">
           <div className="pt-4">
             <ComputeModeSelector mode={computeMode} onChange={setComputeMode} platform="dataproc" />
+            {computeMode === 'serverless' && (
+              <div className="mb-4 ml-1">
+                <label className="block text-xs font-medium text-slate-500 mb-1.5">Serverless Engine</label>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setServerlessTier('standard')}
+                    className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition-all ${
+                      serverlessTier === 'standard'
+                        ? 'bg-blue-50 border-blue-300 text-blue-700'
+                        : 'bg-white border-slate-200 text-slate-500 hover:border-slate-300'
+                    }`}
+                  >
+                    Standard
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setServerlessTier('premium')}
+                    className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition-all ${
+                      serverlessTier === 'premium'
+                        ? 'bg-amber-50 border-amber-300 text-amber-700'
+                        : 'bg-white border-slate-200 text-slate-500 hover:border-slate-300'
+                    }`}
+                  >
+                    Premium (Lightning)
+                  </button>
+                </div>
+              </div>
+            )}
             {/* Config Row */}
             <div className="flex flex-wrap items-end gap-4 mb-6">
               <FormField label="Scale Factor">
@@ -1624,6 +1656,38 @@ export default function DataprocTab() {
                   ({manualPrereqs.filter(p => p.status === 'exists' || p.status === 'created').length}/{manualPrereqs.length} passed)
                 </span>
               )}
+            </div>
+          )}
+
+          {/* Compute mode selector for manual */}
+          <ComputeModeSelector mode={computeMode} onChange={setComputeMode} platform="dataproc" />
+          {computeMode === 'serverless' && (
+            <div className="mb-4 ml-1">
+              <label className="block text-xs font-medium text-slate-500 mb-1.5">Serverless Engine</label>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => setServerlessTier('standard')}
+                  className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition-all ${
+                    serverlessTier === 'standard'
+                      ? 'bg-blue-50 border-blue-300 text-blue-700'
+                      : 'bg-white border-slate-200 text-slate-500 hover:border-slate-300'
+                  }`}
+                >
+                  Standard
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setServerlessTier('premium')}
+                  className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition-all ${
+                    serverlessTier === 'premium'
+                      ? 'bg-amber-50 border-amber-300 text-amber-700'
+                      : 'bg-white border-slate-200 text-slate-500 hover:border-slate-300'
+                  }`}
+                >
+                  Premium (Lightning)
+                </button>
+              </div>
             </div>
           )}
 

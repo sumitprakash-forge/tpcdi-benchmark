@@ -6,6 +6,7 @@ No gcloud CLI or service account key required.
 """
 import asyncio
 import json
+import os
 import time
 import traceback
 from typing import Optional
@@ -144,6 +145,7 @@ class DataprocFullRunRequest(BaseModel):
     metrics_output: str = "gs://sumit_prakash_gcs/tpcdi/metrics"
     gcp_refresh_token: str = ""  # Auto-refresh: re-auth before each run
     compute_mode: str = "classic"  # "classic" or "serverless"
+    serverless_tier: str = "standard"  # "standard" or "premium" (Lightning Engine)
 
 
 # ── Active runs tracker ──────────────────────────────────────────────────
@@ -151,6 +153,126 @@ class DataprocFullRunRequest(BaseModel):
 _active_runs: dict[str, dict] = {}
 _run_counter = 0
 _cancelled_runs: set[str] = set()
+
+_RUNS_FILE = "/tmp/dataproc_runs.json"
+
+
+def _persist_runs():
+    """Write active runs to disk so state survives app restart."""
+    try:
+        # Only persist serializable fields (no async objects)
+        serializable = {}
+        for rid, run in _active_runs.items():
+            serializable[rid] = {k: v for k, v in run.items() if isinstance(v, (str, int, float, bool, list, dict, type(None)))}
+        with open(_RUNS_FILE, "w") as f:
+            json.dump(serializable, f)
+    except Exception as e:
+        print(f"[dataproc] WARNING: failed to persist runs: {e}")
+
+
+def _load_persisted_runs():
+    """Load persisted runs from disk on startup."""
+    global _active_runs, _run_counter
+    if os.path.exists(_RUNS_FILE):
+        try:
+            with open(_RUNS_FILE) as f:
+                _active_runs.update(json.load(f))
+            # Update _run_counter to avoid ID collisions with persisted runs
+            for rid in _active_runs:
+                if rid.startswith("dp-"):
+                    try:
+                        num = int(rid.split("-", 1)[1])
+                        if num >= _run_counter:
+                            _run_counter = num
+                    except (ValueError, IndexError):
+                        pass
+            print(f"[dataproc] Loaded {len(_active_runs)} persisted runs from {_RUNS_FILE}")
+        except Exception as e:
+            print(f"[dataproc] WARNING: failed to load persisted runs: {e}")
+
+
+def _reconcile_persisted_runs():
+    """Check GCP for status of any runs that were RUNNING when persisted.
+
+    Uses synchronous GCP API calls since this runs at module import time.
+    For still-running jobs, we just load the state — the frontend will
+    resume polling via /api/dataproc/run-status/{run_id}.
+    """
+    from google.cloud import dataproc_v1
+
+    for run_id, run in list(_active_runs.items()):
+        if run.get("state") != "RUNNING":
+            continue
+
+        compute_mode = run.get("compute_mode", "classic")
+        job_id = run.get("job_id")
+        if not job_id:
+            continue
+
+        print(f"[dataproc] Reconciling run {run_id} (job_id={job_id}, mode={compute_mode})")
+
+        try:
+            creds = get_credentials()
+            if not creds:
+                continue
+
+            project = run.get("_project", run.get("config", {}).get("project", "gcp-sandbox-field-eng") if isinstance(run.get("config"), dict) else "gcp-sandbox-field-eng")
+            region = run.get("_region", "us-central1")
+            endpoint = f"{region}-dataproc.googleapis.com:443"
+
+            if compute_mode == "serverless":
+                client = dataproc_v1.BatchControllerClient(
+                    credentials=creds,
+                    client_options={"api_endpoint": endpoint},
+                )
+                batch = client.get_batch(
+                    name=f"projects/{project}/locations/{region}/batches/{job_id}"
+                )
+                state_name = batch.state.name
+                if state_name == "SUCCEEDED":
+                    run["state"] = "DONE"
+                    run["phase"] = "completed"
+                    if not run.get("job_done_ms"):
+                        run["job_done_ms"] = int(time.time() * 1000)
+                        run["cluster_deleted_ms"] = run["job_done_ms"]
+                        run["duration_ms"] = run["job_done_ms"] - run["start_time_ms"]
+                elif state_name in ("FAILED", "CANCELLED"):
+                    run["state"] = "ERROR"
+                    run["phase"] = "failed"
+                    run["error"] = batch.state_message or state_name
+                # else still RUNNING — will be picked up by frontend polling
+            else:
+                client = dataproc_v1.JobControllerClient(
+                    credentials=creds,
+                    client_options={"api_endpoint": endpoint},
+                )
+                job_status = client.get_job(
+                    request={"project_id": project, "region": region, "job_id": job_id}
+                )
+                state_name = job_status.status.state.name
+                if state_name == "DONE":
+                    run["state"] = "DONE"
+                    run["phase"] = "completed"
+                    if not run.get("job_done_ms"):
+                        run["job_done_ms"] = int(time.time() * 1000)
+                elif state_name in ("ERROR", "CANCELLED"):
+                    run["state"] = "ERROR"
+                    run["phase"] = "failed"
+                    run["error"] = state_name
+
+            _persist_runs()
+        except Exception as e:
+            print(f"[dataproc] WARNING: reconciliation failed for {run_id}: {e}")
+
+
+# Load persisted runs on module import
+_load_persisted_runs()
+
+# Attempt reconciliation (best-effort, will silently skip if no creds available)
+try:
+    _reconcile_persisted_runs()
+except Exception as _e:
+    print(f"[dataproc] Reconciliation skipped: {_e}")
 
 
 def _next_run_id() -> str:
@@ -702,7 +824,11 @@ async def run_full_cycle(req: DataprocFullRunRequest):
             "load_type": req.load_type, "batch_id": req.batch_id,
             "scale_factor": req.scale_factor,
         },
+        "_project": req.project,
+        "_region": req.region,
+        "_gcs_bucket": req.gcs_bucket,
     }
+    _persist_runs()
 
     if is_serverless:
         asyncio.create_task(_run_serverless_batch_task(run_id, req))
@@ -734,12 +860,14 @@ async def _run_serverless_batch_task(run_id: str, req: DataprocFullRunRequest):
             run["state"] = "ERROR"
             run["error"] = "Google credentials expired"
             run["phase"] = "failed"
+            _persist_runs()
             return
 
         batch_client = _fresh_batch_client()
 
         # No cluster creation phase — go straight to job submission
         run["phase"] = "submitting_batch"
+        _persist_runs()
 
         # Build script args — no spark-master for serverless
         script_args = [
@@ -760,6 +888,11 @@ async def _run_serverless_batch_task(run_id: str, req: DataprocFullRunRequest):
         if req.batch_id:
             script_args.extend(["--batch-id", req.batch_id])
 
+        # Determine runtime properties based on serverless tier
+        runtime_props = {}
+        if req.serverless_tier == "premium":
+            runtime_props["spark.dataproc.serverless.premiumTier"] = "true"
+
         batch = dataproc_v1.Batch(
             pyspark_batch=dataproc_v1.PySparkBatch(
                 main_python_file_uri=f"gs://{req.gcs_bucket}/tpcdi/dataproc/run_benchmark_dataproc.py",
@@ -769,6 +902,7 @@ async def _run_serverless_batch_task(run_id: str, req: DataprocFullRunRequest):
             ),
             runtime_config=dataproc_v1.RuntimeConfig(
                 version="2.3",
+                properties=runtime_props if runtime_props else None,
             ),
             environment_config=dataproc_v1.EnvironmentConfig(
                 execution_config=dataproc_v1.ExecutionConfig(
@@ -790,6 +924,7 @@ async def _run_serverless_batch_task(run_id: str, req: DataprocFullRunRequest):
         run["job_submitted_ms"] = int(time.time() * 1000)
         # For serverless, cluster_created_ms = job_submitted_ms (no separate cluster phase)
         run["cluster_created_ms"] = run["job_submitted_ms"]
+        _persist_runs()
 
         operation = batch_client.create_batch(
             request={
@@ -801,6 +936,7 @@ async def _run_serverless_batch_task(run_id: str, req: DataprocFullRunRequest):
 
         run["job_id"] = batch_id
         run["cluster_name"] = f"serverless-{batch_id}"
+        _persist_runs()
 
         # Poll for completion
         _last_client_refresh = time.time()
@@ -814,6 +950,7 @@ async def _run_serverless_batch_task(run_id: str, req: DataprocFullRunRequest):
                     pass
                 run["state"] = "CANCELLED"
                 run["phase"] = "cancelled"
+                _persist_runs()
                 return
 
             await asyncio.sleep(15)
@@ -845,6 +982,7 @@ async def _run_serverless_batch_task(run_id: str, req: DataprocFullRunRequest):
                     run["cluster_deleted_ms"] = run["job_done_ms"]
                     total_ms = run["job_done_ms"] - run["start_time_ms"]
                     run["duration_ms"] = total_ms
+                    _persist_runs()
                     return
             except Exception as poll_err:
                 print(f"[dataproc-serverless] Poll error: {poll_err}")
@@ -857,19 +995,43 @@ async def _run_serverless_batch_task(run_id: str, req: DataprocFullRunRequest):
         run["duration_ms"] = total_ms
         run["state"] = "DONE"
         run["phase"] = "completed"
+        _persist_runs()
 
-        # Cost estimation for serverless (DCU-based)
+        # Cost from actual DCU usage reported by Dataproc Serverless
+        DCU_PRICE_PER_HOUR = 0.065
+        SHUFFLE_STORAGE_PRICE_PER_GB_HOUR = 0.000054  # premium shuffle storage
         hours = total_ms / 3_600_000
-        # Dataproc Serverless pricing: ~$0.065/DCU-hour, estimate ~4 DCUs for typical workload
-        estimated_dcus = 4
-        dcu_cost = estimated_dcus * 0.065 * hours
+        dcu_hours = 0.0
+        shuffle_gb_hours = 0.0
+        try:
+            batch_client = _fresh_batch_client()
+            final_batch = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: batch_client.get_batch(
+                    name=f"projects/{req.project}/locations/{req.region}/batches/{batch_id}"
+                ),
+            )
+            usage = final_batch.runtime_info.approximate_usage
+            milli_dcu_seconds = int(usage.milli_dcu_seconds) if usage.milli_dcu_seconds else 0
+            shuffle_gb_seconds = int(usage.shuffle_storage_gb_seconds) if usage.shuffle_storage_gb_seconds else 0
+            dcu_hours = milli_dcu_seconds / 1000.0 / 3600.0
+            shuffle_gb_hours = shuffle_gb_seconds / 3600.0
+            print(f"[dataproc-serverless] Actual usage: {dcu_hours:.3f} DCU-hours, {shuffle_gb_hours:.1f} GB-hours shuffle")
+        except Exception as cost_err:
+            print(f"[dataproc-serverless] WARNING: could not read actual DCU usage: {cost_err}, falling back to estimate")
+            dcu_hours = 4.0 * hours  # fallback estimate
+
+        dcu_cost = dcu_hours * DCU_PRICE_PER_HOUR
+        shuffle_cost = shuffle_gb_hours * SHUFFLE_STORAGE_PRICE_PER_GB_HOUR
+        total_cost = dcu_cost + shuffle_cost
         run["cost"] = {
-            "vm_cost_usd": 0,
-            "dataproc_premium_usd": round(dcu_cost, 4),
+            "vm_cost_usd": round(dcu_cost, 4),  # DCU compute cost (analogous to VM cost)
+            "dataproc_premium_usd": round(shuffle_cost, 4),  # shuffle storage cost
             "ssd_cost_usd": 0,
-            "total_cost_usd": round(dcu_cost, 4),
+            "total_cost_usd": round(total_cost, 4),
             "duration_hours": round(hours, 4),
             "duration_ms": total_ms,
+            "dcu_hours": round(dcu_hours, 4),
             "cluster": {
                 "master_type": "serverless",
                 "worker_type": "serverless",
@@ -877,6 +1039,7 @@ async def _run_serverless_batch_task(run_id: str, req: DataprocFullRunRequest):
                 "ssd_count": 0,
             },
         }
+        _persist_runs()
 
     except Exception as e:
         run["state"] = "ERROR"
@@ -888,6 +1051,7 @@ async def _run_serverless_batch_task(run_id: str, req: DataprocFullRunRequest):
             run["cluster_deleted_ms"] = int(time.time() * 1000)
         if run.get("start_time_ms"):
             run["duration_ms"] = run["cluster_deleted_ms"] - run["start_time_ms"]
+        _persist_runs()
 
 
 async def _run_full_cycle_task(run_id: str, req: DataprocFullRunRequest):
@@ -927,6 +1091,7 @@ async def _run_full_cycle_task(run_id: str, req: DataprocFullRunRequest):
             run["state"] = "ERROR"
             run["error"] = "Google credentials expired"
             run["phase"] = "failed"
+            _persist_runs()
             return
 
         cluster_client = _fresh_cluster_client()
@@ -934,6 +1099,7 @@ async def _run_full_cycle_task(run_id: str, req: DataprocFullRunRequest):
 
         # ── Phase 1: Create Cluster ─────────────────────────────────
         run["phase"] = "creating_cluster"
+        _persist_runs()
 
         disk_config_master = dataproc_v1.DiskConfig(
             boot_disk_size_gb=100,
@@ -993,16 +1159,19 @@ async def _run_full_cycle_task(run_id: str, req: DataprocFullRunRequest):
         )
 
         run["cluster_created_ms"] = int(time.time() * 1000)
+        _persist_runs()
 
         if run_id in _cancelled_runs:
             run["state"] = "CANCELLED"
             run["phase"] = "cancelled"
+            _persist_runs()
             await _cleanup_cluster_api(cluster_client, req, run)
             return
 
         # ── Phase 2: Submit Job ──────────────────────────────────────
         run["phase"] = "running_job"
         run["job_submitted_ms"] = int(time.time() * 1000)
+        _persist_runs()
 
         # Refresh clients — cluster creation can take 5+ minutes
         job_client = _fresh_job_client()
@@ -1060,6 +1229,7 @@ async def _run_full_cycle_task(run_id: str, req: DataprocFullRunRequest):
                     pass
                 run["state"] = "CANCELLED"
                 run["phase"] = "cancelled"
+                _persist_runs()
                 cluster_client = _fresh_cluster_client()
                 await _cleanup_cluster_api(cluster_client, req, run)
                 return
@@ -1087,19 +1257,23 @@ async def _run_full_cycle_task(run_id: str, req: DataprocFullRunRequest):
                 break
 
         run["job_done_ms"] = int(time.time() * 1000)
+        _persist_runs()
 
         if state != "DONE":
             error_detail = job_status.status.details if job_status.status.details else state
             run["state"] = "ERROR"
             run["error"] = f"Job {state}: {error_detail}"
             run["phase"] = "deleting_cluster"
+            _persist_runs()
             cluster_client = _fresh_cluster_client()
             await _cleanup_cluster_api(cluster_client, req, run)
             run["phase"] = "failed"
+            _persist_runs()
             return
 
         # ── Phase 3: Delete Cluster ──────────────────────────────────
         run["phase"] = "deleting_cluster"
+        _persist_runs()
         cluster_client = _fresh_cluster_client()
         await _cleanup_cluster_api(cluster_client, req, run)
         # cluster_deleted_ms is set by the helper on success; fall back to now
@@ -1116,6 +1290,7 @@ async def _run_full_cycle_task(run_id: str, req: DataprocFullRunRequest):
         # Report DONE even if cluster deletion failed – the job itself succeeded.
         run["state"] = "DONE"
         run["phase"] = "completed"
+        _persist_runs()
 
     except Exception as e:
         traceback.print_exc()
@@ -1133,6 +1308,7 @@ async def _run_full_cycle_task(run_id: str, req: DataprocFullRunRequest):
                 await _cleanup_cluster_api(cc, req, run)
         except Exception:
             pass
+        _persist_runs()
 
 
 async def _cleanup_cluster_api(cluster_client, req, run: dict | None = None):
