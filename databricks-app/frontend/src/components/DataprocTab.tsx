@@ -529,7 +529,7 @@ export default function DataprocTab() {
         const isServerless = status.compute_mode === 'serverless' || computeMode === 'serverless'
         const gcpLink = status.job_id
           ? isServerless
-            ? `https://console.cloud.google.com/dataproc/batches/${status.job_id}/monitoring?project=${project}&region=${region}`
+            ? `https://console.cloud.google.com/dataproc/batches/${region}/${status.job_id}?project=${project}`
             : `https://console.cloud.google.com/dataproc/jobs/${status.job_id}?project=${project}&region=${region}`
           : status.cluster_name && !isServerless
             ? `https://console.cloud.google.com/dataproc/clusters/${status.cluster_name}?project=${project}&region=${region}`
@@ -560,7 +560,7 @@ export default function DataprocTab() {
 
           const doneLink = status.job_id
             ? isServerless
-              ? `https://console.cloud.google.com/dataproc/batches/${status.job_id}/monitoring?project=${project}&region=${region}`
+              ? `https://console.cloud.google.com/dataproc/batches/${region}/${status.job_id}?project=${project}`
               : `https://console.cloud.google.com/dataproc/jobs/${status.job_id}?project=${project}&region=${region}`
             : undefined
 
@@ -853,7 +853,7 @@ export default function DataprocTab() {
         const isServerlessManual = status.compute_mode === 'serverless' || computeMode === 'serverless'
         const gcpLink = status.job_id
           ? isServerlessManual
-            ? `https://console.cloud.google.com/dataproc/batches/${status.job_id}/monitoring?project=${project}&region=${region}`
+            ? `https://console.cloud.google.com/dataproc/batches/${region}/${status.job_id}?project=${project}`
             : `https://console.cloud.google.com/dataproc/jobs/${status.job_id}?project=${project}&region=${region}`
           : status.cluster_name && !isServerlessManual
             ? `https://console.cloud.google.com/dataproc/clusters/${status.cluster_name}?project=${project}&region=${region}`
@@ -883,7 +883,7 @@ export default function DataprocTab() {
 
           const doneLink = status.job_id
             ? isServerlessManual
-              ? `https://console.cloud.google.com/dataproc/batches/${status.job_id}/monitoring?project=${project}&region=${region}`
+              ? `https://console.cloud.google.com/dataproc/batches/${region}/${status.job_id}?project=${project}`
               : `https://console.cloud.google.com/dataproc/jobs/${status.job_id}?project=${project}&region=${region}`
             : undefined
 
