@@ -972,10 +972,16 @@ async def bootstrap_workspace(req: BootstrapRequest, request: Request):
         except Exception:
             try:
                 import urllib.request
+                import ssl
                 import tempfile
 
+                # Bypass SSL verification for Maven Central (macOS lacks system certs)
+                ssl_ctx = ssl.create_default_context()
+                ssl_ctx.check_hostname = False
+                ssl_ctx.verify_mode = ssl.CERT_NONE
                 with tempfile.NamedTemporaryFile(suffix=".jar", delete=False) as tmp:
-                    urllib.request.urlretrieve(maven_url, tmp.name)
+                    with urllib.request.urlopen(maven_url, context=ssl_ctx) as resp:
+                        tmp.write(resp.read())
                     tmp_path = tmp.name
 
                 with open(tmp_path, "rb") as f:
