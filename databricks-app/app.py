@@ -13,6 +13,12 @@ from server.dataproc_routes import router as dataproc_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Restore any Dataproc runs that were active before a restart
+    try:
+        from server.dataproc_routes import restore_active_dataproc_runs
+        await restore_active_dataproc_runs()
+    except Exception as e:
+        print(f"[startup] WARNING: failed to restore Dataproc runs: {e}")
     yield
 
 app = FastAPI(title="TPC-DI Benchmark", lifespan=lifespan)

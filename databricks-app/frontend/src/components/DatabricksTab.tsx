@@ -1102,6 +1102,23 @@ export default function DatabricksTab() {
     await startManualRunSpec(first)
   }
 
+  async function handleRunSingleStep(stepIndex: number) {
+    if (!adminToken || !tokenUser) {
+      addToast('PAT token is required. Enter a valid Databricks PAT token to run jobs.', 'error')
+      return
+    }
+    const specs = buildManualPipelineSpecs(scaleFactor)
+    const spec = specs[stepIndex]
+    updateManualStep(stepIndex, { status: 'pending', output: '', duration_ms: null, link: undefined })
+    setManualCosts(prev => { const next = [...prev]; next[stepIndex] = null; return next })
+    setManualRunning(true)
+    setManualRunId(null)
+    setManualActiveStep(null)
+    setManualRemainingSpecs([])
+    manualCancelledRef.current = false
+    await startManualRunSpec(spec)
+  }
+
   const [manualCancelling, setManualCancelling] = useState(false)
 
   async function handleCancelManualPipeline() {
@@ -1742,6 +1759,14 @@ export default function DatabricksTab() {
                     }`}>
                       {step.status}
                     </span>
+                    {!manualRunning && (
+                      <button
+                        onClick={() => handleRunSingleStep(i)}
+                        className="text-[10px] font-medium px-2 py-0.5 rounded border bg-orange-50 border-orange-200 text-orange-600 hover:bg-orange-100 hover:border-orange-300 transition-all"
+                      >
+                        Run
+                      </button>
+                    )}
                   </div>
                 </div>
                 {step.output && (

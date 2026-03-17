@@ -29,5 +29,8 @@ sa-key.json
 .DS_Store
 Thumbs.db
 
+# Run history (persisted to workspace, not git)
+runs/
+
 # Databricks
 .databricks/
