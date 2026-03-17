@@ -247,13 +247,14 @@ export default function DatabricksTab() {
   const [loadingPrereqCheck, setLoadingPrereqCheck] = useState(false)
   const [loadingPrereqCreate, setLoadingPrereqCreate] = useState(false)
   const [fixingGcsIam, setFixingGcsIam] = useState(false)
+  const [workspaceUrl, setWorkspaceUrl] = useState(() => localStorage.getItem('tpcdi_databricks_workspace_url') || '')
   const [adminToken, setAdminToken] = useState(() => localStorage.getItem('tpcdi_databricks_pat') || '')
   const [tokenUser, setTokenUser] = useState<{ user_name: string; display_name: string } | null>(null)
   const [resolvingToken, setResolvingToken] = useState(false)
   const [tokenError, setTokenError] = useState<string | null>(null)
 
   // Benchmark config state
-  const [loadType, _setLoadType] = useState('batch')
+  const [_loadType, _setLoadType] = useState('batch')
   const [scaleFactor, setScaleFactor] = useState('10')
   const [targetCatalog, setTargetCatalog] = useState('gcp_tpcdi_sandbox')
   const [targetSchema, setTargetSchema] = useState('dw')
@@ -261,12 +262,12 @@ export default function DatabricksTab() {
   const [computeMode, setComputeMode] = useState<ComputeMode>('classic')
   const [cloud, setCloud] = useState('GCP')
   const [xmlFormat, setXmlFormat] = useState('com.databricks.spark.xml')
-  const [sparkVersion, setSparkVersion] = useState('17.3.x-scala2.13')
-  const [workerNodeType, setWorkerNodeType] = useState('n2-highmem-16')
-  const [driverNodeType, setDriverNodeType] = useState('n2-highmem-16')
-  const [numWorkers, setNumWorkers] = useState(3)
+  const sparkVersion = '17.3.x-scala2.13'
+  const workerNodeType = 'n2-highmem-16'
+  const driverNodeType = 'n2-highmem-16'
+  const numWorkers = 3
   const [jarPath, setJarPath] = useState('')
-  const [localSsds, setLocalSsds] = useState(2)
+  const localSsds = 2
   const [photon, setPhoton] = useState(true)
   const [logDetailedStats, setLogDetailedStats] = useState(true)
 
@@ -295,37 +296,47 @@ export default function DatabricksTab() {
     { value: 'c2-standard-30', label: 'c2-standard-30 (30 vCPU, 120 GB)' },
   ]
 
-  // Sizing suggestions based on load type and scale factor
-  interface SizingConfig {
-    driver: string
-    worker: string
-    workers: number
-    label: string
+  // Per-step cluster config for manual pipeline
+  interface StepClusterConfig {
+    sparkVersion: string
+    workerNodeType: string
+    driverNodeType: string
+    numWorkers: number
+    localSsds: number
   }
 
-  const sizingConfig: SizingConfig | null = (() => {
-    const sf = parseInt(scaleFactor)
-    if (loadType === 'batch') {
-      if (sf <= 10) return { driver: 'n2d-standard-4', worker: 'n2d-standard-4', workers: 2, label: 'Small batch' }
-      if (sf <= 100) return { driver: 'n2d-standard-8', worker: 'n2d-standard-8', workers: 2, label: 'Medium batch' }
-      if (sf <= 1000) return { driver: 'n2d-standard-8', worker: 'n2d-standard-8', workers: 5, label: 'Large batch' }
-      return { driver: 'n2d-standard-8', worker: 'n2d-standard-16', workers: 6, label: 'XL batch' }
-    } else {
-      if (sf <= 10) return { driver: 'n2d-standard-4', worker: 'n2d-standard-4', workers: 2, label: 'Small incremental' }
-      if (sf <= 100) return { driver: 'n2d-standard-8', worker: 'n2d-standard-4', workers: 2, label: 'Medium incremental' }
-      if (sf <= 1000) return { driver: 'n2d-standard-8', worker: 'n2d-standard-8', workers: 3, label: 'Large incremental' }
-      return { driver: 'n2d-standard-8', worker: 'n2d-standard-16', workers: 5, label: 'XL incremental' }
-    }
-  })()
+  function buildDefaultStepConfigs(sf: string): StepClusterConfig[] {
+    const n = parseInt(sf)
+    const batchSizing = (() => {
+      if (n <= 10) return { driver: 'n2d-standard-4', worker: 'n2d-standard-4', workers: 2 }
+      if (n <= 100) return { driver: 'n2d-standard-8', worker: 'n2d-standard-8', workers: 2 }
+      if (n <= 1000) return { driver: 'n2d-standard-8', worker: 'n2d-standard-8', workers: 5 }
+      return { driver: 'n2d-standard-8', worker: 'n2d-standard-16', workers: 6 }
+    })()
+    const incSizing = (() => {
+      if (n <= 10) return { driver: 'n2d-standard-4', worker: 'n2d-standard-4', workers: 2 }
+      if (n <= 100) return { driver: 'n2d-standard-8', worker: 'n2d-standard-4', workers: 2 }
+      if (n <= 1000) return { driver: 'n2d-standard-8', worker: 'n2d-standard-8', workers: 3 }
+      return { driver: 'n2d-standard-8', worker: 'n2d-standard-16', workers: 5 }
+    })()
+    return [
+      { sparkVersion: '17.3.x-scala2.13', driverNodeType: batchSizing.driver, workerNodeType: batchSizing.worker, numWorkers: batchSizing.workers, localSsds: 2 },
+      { sparkVersion: '17.3.x-scala2.13', driverNodeType: incSizing.driver, workerNodeType: incSizing.worker, numWorkers: incSizing.workers, localSsds: 2 },
+      { sparkVersion: '17.3.x-scala2.13', driverNodeType: incSizing.driver, workerNodeType: incSizing.worker, numWorkers: incSizing.workers, localSsds: 2 },
+    ]
+  }
 
-  // Apply sizing suggestion when load type or scale factor changes
+  const [stepConfigs, setStepConfigs] = useState<StepClusterConfig[]>(() => buildDefaultStepConfigs('10'))
+  const [expandedStepConfig, setExpandedStepConfig] = useState<number | null>(null)
+
+  function updateStepConfig(i: number, patch: Partial<StepClusterConfig>) {
+    setStepConfigs(prev => prev.map((c, idx) => idx === i ? { ...c, ...patch } : c))
+  }
+
+  // Re-default step configs when scale factor changes
   useEffect(() => {
-    if (sizingConfig) {
-      setDriverNodeType(sizingConfig.driver)
-      setWorkerNodeType(sizingConfig.worker)
-      setNumWorkers(sizingConfig.workers)
-    }
-  }, [loadType, scaleFactor])
+    setStepConfigs(buildDefaultStepConfigs(scaleFactor))
+  }, [scaleFactor])
 
   // Run state - restore jobId from localStorage
   const [jobId, _setJobId] = useState<number | null>(() => {
@@ -374,7 +385,15 @@ export default function DatabricksTab() {
   const manualStartingRef = useRef(false)
   const [manualSaveNeeded, setManualSaveNeeded] = useState(false)
 
-  // Persist PAT token to localStorage
+  // Persist workspace URL + PAT token to localStorage
+  useEffect(() => {
+    if (workspaceUrl) {
+      localStorage.setItem('tpcdi_databricks_workspace_url', workspaceUrl)
+    } else {
+      localStorage.removeItem('tpcdi_databricks_workspace_url')
+    }
+  }, [workspaceUrl])
+
   useEffect(() => {
     if (adminToken) {
       localStorage.setItem('tpcdi_databricks_pat', adminToken)
@@ -500,7 +519,7 @@ export default function DatabricksTab() {
   }
 
   // Resolve PAT token to user info
-  const resolveToken = useCallback(async (token: string) => {
+  const resolveToken = useCallback(async (token: string, wsUrl: string) => {
     if (!token || token.length < 10) {
       setTokenUser(null)
       setTokenError(null)
@@ -511,7 +530,7 @@ export default function DatabricksTab() {
     try {
       const data = await apiCall('/api/databricks/resolve-token', {
         method: 'POST',
-        body: JSON.stringify({ token }),
+        body: JSON.stringify({ token, workspace_url: wsUrl }),
       })
       setTokenUser({ user_name: data.user_name, display_name: data.display_name })
     } catch (e: any) {
@@ -525,9 +544,9 @@ export default function DatabricksTab() {
   // Debounced token resolution
   useEffect(() => {
     if (!adminToken) { setTokenUser(null); setTokenError(null); return }
-    const timer = setTimeout(() => resolveToken(adminToken), 500)
+    const timer = setTimeout(() => resolveToken(adminToken, workspaceUrl), 500)
     return () => clearTimeout(timer)
-  }, [adminToken, resolveToken])
+  }, [adminToken, workspaceUrl, resolveToken])
 
   // Sync targetCatalog with catalogName
   useEffect(() => {
@@ -568,6 +587,7 @@ export default function DatabricksTab() {
           schema_name: targetSchema,
           raw_data_path: rawDataPath,
           admin_token: adminToken,
+          workspace_url: workspaceUrl,
         }),
       })
       setPrereqResult(data)
@@ -700,6 +720,7 @@ export default function DatabricksTab() {
           local_ssds: sizing.ssds,
           log_detailed_stats: true,
           admin_token: adminToken,
+          workspace_url: workspaceUrl,
           compute_mode: computeMode,
         }),
       })
@@ -716,7 +737,7 @@ export default function DatabricksTab() {
     try {
       const runResult = await apiCall('/api/databricks/run-job', {
         method: 'POST',
-        body: JSON.stringify({ job_id: createdJobId, admin_token: adminToken }),
+        body: JSON.stringify({ job_id: createdJobId, admin_token: adminToken, workspace_url: workspaceUrl }),
       })
       setE2eRunId(runResult.run_id)
       updateE2EStep(stepIndex, {
@@ -746,7 +767,8 @@ export default function DatabricksTab() {
     const poll = async () => {
       try {
         const tokenParam = adminToken ? `&admin_token=${encodeURIComponent(adminToken)}` : ''
-        const status = await apiCall(`/api/databricks/job-status/${e2eRunId}?_=1${tokenParam}`)
+        const wsParam = workspaceUrl ? `&workspace_url=${encodeURIComponent(workspaceUrl)}` : ''
+        const status = await apiCall(`/api/databricks/job-status/${e2eRunId}?_=1${tokenParam}${wsParam}`)
         const stateStr = status.result_state
           ? `${status.state} (${status.result_state})`
           : status.state
@@ -770,7 +792,8 @@ export default function DatabricksTab() {
           if (isSuccess) {
             try {
               const costTokenParam = adminToken ? `?admin_token=${encodeURIComponent(adminToken)}` : ''
-              const costData = await apiCall(`/api/databricks/run-cost/${e2eRunId}${costTokenParam}`)
+              const costWsParam = workspaceUrl ? `${costTokenParam ? '&' : '?'}workspace_url=${encodeURIComponent(workspaceUrl)}` : ''
+              const costData = await apiCall(`/api/databricks/run-cost/${e2eRunId}${costTokenParam}${costWsParam}`)
               setRunCosts(prev => {
                 const next = [...prev]
                 next[stepIdx - 1] = costData
@@ -830,8 +853,8 @@ export default function DatabricksTab() {
 
   // Main E2E handler: prereqs then queue all run specs
   async function handleRunE2E() {
-    if (!adminToken || !tokenUser) {
-      addToast('PAT token is required. Enter a valid Databricks PAT token to run jobs.', 'error')
+    if (!workspaceUrl || !adminToken || !tokenUser) {
+      addToast('Workspace URL and PAT token are required to run jobs.', 'error')
       return
     }
     const steps = buildE2ESteps(e2eSF)
@@ -861,7 +884,7 @@ export default function DatabricksTab() {
         updateE2EStep(0, { output: 'Some prerequisites missing. Creating...', details: checkDetails })
         const createData = await apiCall('/api/databricks/verify-prerequisites', {
           method: 'POST',
-          body: JSON.stringify({ catalog_name: catalogName, schema_name: targetSchema, raw_data_path: rawDataPath, admin_token: adminToken }),
+          body: JSON.stringify({ catalog_name: catalogName, schema_name: targetSchema, raw_data_path: rawDataPath, admin_token: adminToken, workspace_url: workspaceUrl }),
         })
         const createDetails: PrereqDetail[] = (createData.steps || []).map((s: any) => ({
           name: s.name,
@@ -923,7 +946,7 @@ export default function DatabricksTab() {
     setCancelling(true)
     e2eCancelledRef.current = true
     try {
-      await apiCall(`/api/databricks/cancel-run/${e2eRunId}?admin_token=${encodeURIComponent(adminToken)}`, { method: 'POST' })
+      await apiCall(`/api/databricks/cancel-run/${e2eRunId}?admin_token=${encodeURIComponent(adminToken)}&workspace_url=${encodeURIComponent(workspaceUrl)}`, { method: 'POST' })
       addToast(`Run ${e2eRunId} cancellation requested`, 'info')
       if (e2eActiveStep !== null) {
         updateE2EStep(e2eActiveStep, { output: `Cancellation requested for run ${e2eRunId}. Waiting for confirmation...` })
@@ -962,15 +985,16 @@ export default function DatabricksTab() {
           batch_id: bid,
           cloud,
           xml_format: xmlFormat,
-          spark_version: sparkVersion,
-          worker_node_type: workerNodeType,
-          driver_node_type: driverNodeType,
-          num_workers: numWorkers,
+          spark_version: stepConfigs[stepIndex]?.sparkVersion ?? sparkVersion,
+          worker_node_type: stepConfigs[stepIndex]?.workerNodeType ?? workerNodeType,
+          driver_node_type: stepConfigs[stepIndex]?.driverNodeType ?? driverNodeType,
+          num_workers: stepConfigs[stepIndex]?.numWorkers ?? numWorkers,
           jar_path: effectiveJarPath,
           photon,
-          local_ssds: localSsds,
+          local_ssds: stepConfigs[stepIndex]?.localSsds ?? localSsds,
           log_detailed_stats: logDetailedStats,
           admin_token: adminToken,
+          workspace_url: workspaceUrl,
           compute_mode: computeMode,
         }),
       })
@@ -987,7 +1011,7 @@ export default function DatabricksTab() {
     try {
       const runResult = await apiCall('/api/databricks/run-job', {
         method: 'POST',
-        body: JSON.stringify({ job_id: createdJobId, admin_token: adminToken }),
+        body: JSON.stringify({ job_id: createdJobId, admin_token: adminToken, workspace_url: workspaceUrl }),
       })
       setManualRunId(runResult.run_id)
       updateManualStep(stepIndex, {
@@ -1011,7 +1035,8 @@ export default function DatabricksTab() {
     const poll = async () => {
       try {
         const mTokenParam = adminToken ? `&admin_token=${encodeURIComponent(adminToken)}` : ''
-        const status = await apiCall(`/api/databricks/job-status/${manualRunId}?_=1${mTokenParam}`)
+        const mWsParam = workspaceUrl ? `&workspace_url=${encodeURIComponent(workspaceUrl)}` : ''
+        const status = await apiCall(`/api/databricks/job-status/${manualRunId}?_=1${mTokenParam}${mWsParam}`)
         const stateStr = status.result_state
           ? `${status.state} (${status.result_state})`
           : status.state
@@ -1034,7 +1059,8 @@ export default function DatabricksTab() {
           if (isSuccess) {
             try {
               const mCostParam = adminToken ? `?admin_token=${encodeURIComponent(adminToken)}` : ''
-              const costData = await apiCall(`/api/databricks/run-cost/${manualRunId}${mCostParam}`)
+              const mCostWsParam = workspaceUrl ? `${mCostParam ? '&' : '?'}workspace_url=${encodeURIComponent(workspaceUrl)}` : ''
+              const costData = await apiCall(`/api/databricks/run-cost/${manualRunId}${mCostParam}${mCostWsParam}`)
               setManualCosts(prev => {
                 const next = [...prev]
                 next[stepIdx] = costData
@@ -1083,8 +1109,8 @@ export default function DatabricksTab() {
   }, [manualRunId, manualRunning, manualRemainingSpecs])
 
   async function handleManualPipeline() {
-    if (!adminToken || !tokenUser) {
-      addToast('PAT token is required. Enter a valid Databricks PAT token to run jobs.', 'error')
+    if (!workspaceUrl || !adminToken || !tokenUser) {
+      addToast('Workspace URL and PAT token are required to run jobs.', 'error')
       return
     }
     const steps = buildManualPipelineSteps(scaleFactor)
@@ -1103,8 +1129,8 @@ export default function DatabricksTab() {
   }
 
   async function handleRunSingleStep(stepIndex: number) {
-    if (!adminToken || !tokenUser) {
-      addToast('PAT token is required. Enter a valid Databricks PAT token to run jobs.', 'error')
+    if (!workspaceUrl || !adminToken || !tokenUser) {
+      addToast('Workspace URL and PAT token are required to run jobs.', 'error')
       return
     }
     const specs = buildManualPipelineSpecs(scaleFactor)
@@ -1126,7 +1152,7 @@ export default function DatabricksTab() {
     setManualCancelling(true)
     manualCancelledRef.current = true
     try {
-      await apiCall(`/api/databricks/cancel-run/${manualRunId}?admin_token=${encodeURIComponent(adminToken)}`, { method: 'POST' })
+      await apiCall(`/api/databricks/cancel-run/${manualRunId}?admin_token=${encodeURIComponent(adminToken)}&workspace_url=${encodeURIComponent(workspaceUrl)}`, { method: 'POST' })
       addToast(`Run ${manualRunId} cancellation requested`, 'info')
       if (manualActiveStep !== null) {
         updateManualStep(manualActiveStep, { output: `Cancellation requested for run ${manualRunId}. Waiting for confirmation...` })
@@ -1148,7 +1174,8 @@ export default function DatabricksTab() {
     if (!runId) return
     try {
       const pollTokenParam = adminToken ? `?admin_token=${encodeURIComponent(adminToken)}` : ''
-      const status = await apiCall(`/api/databricks/job-status/${runId}${pollTokenParam}`)
+      const pollWsParam = workspaceUrl ? `${pollTokenParam ? '&' : '?'}workspace_url=${encodeURIComponent(workspaceUrl)}` : ''
+      const status = await apiCall(`/api/databricks/job-status/${runId}${pollTokenParam}${pollWsParam}`)
       setJobStatus(status)
       // Update the run in jobRuns list too
       setJobRuns((prev) =>
@@ -1257,6 +1284,19 @@ export default function DatabricksTab() {
               <FormField label="Raw Data Path">
                 <div className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-md text-sm font-mono text-slate-700 max-w-[260px] truncate" title={rawDataPath}>{rawDataPath}</div>
               </FormField>
+              <FormField label="Databricks Workspace URL (required)">
+                <input
+                  type="url"
+                  className={`px-3 py-2 bg-white border rounded-md text-sm font-mono text-slate-700 ${workspaceUrl ? 'border-green-300' : 'border-orange-300'}`}
+                  value={workspaceUrl}
+                  onChange={e => setWorkspaceUrl(e.target.value.trim())}
+                  placeholder="https://<workspace-id>.azuredatabricks.net"
+                  title="Workspace where jobs will be created and run"
+                />
+                {!workspaceUrl && (
+                  <p className="text-xs text-orange-500 mt-1">Required — enter the workspace URL where jobs should run.</p>
+                )}
+              </FormField>
               <FormField label="Databricks PAT Token (required)">
                 <input
                   type="password"
@@ -1289,7 +1329,7 @@ export default function DatabricksTab() {
                 label={e2eRunning ? 'Running...' : 'Run Full Pipeline'}
                 onClick={handleRunE2E}
                 loading={e2eRunning}
-                disabled={e2eRunning || !adminToken || !tokenUser}
+                disabled={e2eRunning || !workspaceUrl || !adminToken || !tokenUser}
               />
               {e2eRunning && e2eRunId && (
                 <button
@@ -1495,6 +1535,37 @@ export default function DatabricksTab() {
 
           {/* Config inputs */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <FormField label="Databricks Workspace URL (required)">
+              <input
+                type="url"
+                className={`px-3 py-2 bg-white border rounded-md text-sm font-mono text-slate-700 w-full ${workspaceUrl ? 'border-green-300' : 'border-orange-300'}`}
+                value={workspaceUrl}
+                onChange={e => setWorkspaceUrl(e.target.value.trim())}
+                placeholder="https://<workspace-id>.azuredatabricks.net"
+                title="Workspace where jobs will be created and run"
+              />
+              {!workspaceUrl && (
+                <p className="text-xs text-orange-500 mt-1">Required — enter the workspace URL where jobs should run.</p>
+              )}
+            </FormField>
+            <FormField label="Databricks PAT Token (required)">
+              <input
+                type="password"
+                className={`px-3 py-2 bg-white border rounded-md text-sm font-mono text-slate-700 w-full ${tokenError ? 'border-red-300' : tokenUser ? 'border-green-300' : 'border-slate-200'}`}
+                value={adminToken}
+                onChange={e => setAdminToken(e.target.value)}
+                placeholder="dapi..."
+                title="Databricks PAT token — jobs run as this user"
+              />
+              {resolvingToken && <p className="text-xs text-blue-500 mt-1">Resolving token...</p>}
+              {tokenUser && (
+                <p className="text-xs text-green-600 mt-1 flex items-center gap-1">
+                  <span className="w-2 h-2 rounded-full bg-green-400 inline-block" />
+                  Running as: <span className="font-medium">{tokenUser.display_name || tokenUser.user_name}</span>
+                </p>
+              )}
+              {tokenError && <p className="text-xs text-red-500 mt-1">{tokenError}</p>}
+            </FormField>
             <FormField label="Raw Data Path (GCS)">
               <TextInput value={rawDataPath} onChange={setRawDataPath} placeholder="gs://bucket/tpcdi" />
             </FormField>
@@ -1633,32 +1704,10 @@ export default function DatabricksTab() {
               ]}
             />
           </FormField>
-          <FormField label="Spark Version">
-            <SelectInput
-              value={sparkVersion}
-              onChange={setSparkVersion}
-              options={[
-                { value: '17.3.x-scala2.13', label: '17.3 LTS (Scala 2.13)' },
-                { value: '17.3.x-photon-scala2.13', label: '17.3 LTS Photon (Scala 2.13)' },
-                { value: '17.2.x-scala2.13', label: '17.2 (Scala 2.13)' },
-              ]}
-            />
-          </FormField>
           {computeMode === 'classic' && (
-            <>
-              <FormField label="Worker Node Type">
-                <SelectInput value={workerNodeType} onChange={setWorkerNodeType} options={gcpNodeTypes} />
-              </FormField>
-              <FormField label="Driver Node Type">
-                <SelectInput value={driverNodeType} onChange={setDriverNodeType} options={gcpNodeTypes} />
-              </FormField>
-              <FormField label="Number of Workers">
-                <NumberInput value={numWorkers} onChange={setNumWorkers} min={1} max={100} />
-              </FormField>
-              <FormField label="Local SSDs per Node">
-                <NumberInput value={localSsds} onChange={setLocalSsds} min={0} max={8} />
-              </FormField>
-            </>
+            <div className="lg:col-span-3 p-3 bg-amber-50 border border-amber-200 rounded-md text-xs text-amber-700">
+              Cluster config (Spark version, node types, workers, SSDs) is set per load type in Section 3 below.
+            </div>
           )}
           {computeMode === 'serverless' && (
             <div className="lg:col-span-3">
@@ -1715,62 +1764,109 @@ export default function DatabricksTab() {
             {manualSteps.map((step, i) => (
               <div
                 key={i}
-                className={`p-4 rounded-lg border transition-all ${
+                className={`rounded-lg border transition-all ${
                   step.status === 'pending' ? 'bg-slate-50 border-slate-200' :
                   step.status === 'running' ? 'bg-blue-50 border-blue-300 shadow-sm' :
                   step.status === 'success' ? 'bg-green-50 border-green-300' :
                   'bg-red-50 border-red-300'
                 }`}
               >
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-3">
-                    <span className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold ${
-                      step.status === 'pending' ? 'bg-slate-200 text-slate-500' :
-                      step.status === 'running' ? 'bg-blue-500 text-white animate-pulse' :
-                      step.status === 'success' ? 'bg-green-500 text-white' :
-                      'bg-red-500 text-white'
-                    }`}>
-                      {step.status === 'success' ? '\u2713' : step.status === 'error' ? '!' : i + 1}
-                    </span>
-                    <span className="text-sm font-semibold text-slate-700">Step {i + 1}: {step.name}</span>
+                <div className="p-4">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                      <span className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold ${
+                        step.status === 'pending' ? 'bg-slate-200 text-slate-500' :
+                        step.status === 'running' ? 'bg-blue-500 text-white animate-pulse' :
+                        step.status === 'success' ? 'bg-green-500 text-white' :
+                        'bg-red-500 text-white'
+                      }`}>
+                        {step.status === 'success' ? '\u2713' : step.status === 'error' ? '!' : i + 1}
+                      </span>
+                      <div>
+                        <span className="text-sm font-semibold text-slate-700">Step {i + 1}: {step.name}</span>
+                        {computeMode === 'classic' && (
+                          <p className="text-[10px] text-slate-400 font-mono">
+                            {stepConfigs[i]?.workerNodeType} x{stepConfigs[i]?.numWorkers}, {stepConfigs[i]?.localSsds} SSDs · {stepConfigs[i]?.sparkVersion}
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {step.duration_ms !== null && (
+                        <span className="text-xs font-mono text-slate-500">{formatDuration(step.duration_ms)}</span>
+                      )}
+                      {manualCosts[i] && (
+                        <span className="text-xs font-mono text-orange-600">{formatCost(manualCosts[i]!.total_cost_usd)}</span>
+                      )}
+                      {step.link && (
+                        <a href={step.link} target="_blank" rel="noopener noreferrer"
+                          className="text-xs text-orange-600 hover:text-orange-700 underline">
+                          View Run
+                        </a>
+                      )}
+                      <span className={`text-[10px] font-medium uppercase px-2 py-0.5 rounded ${
+                        step.status === 'pending' ? 'bg-slate-200 text-slate-500' :
+                        step.status === 'running' ? 'bg-blue-100 text-blue-700' :
+                        step.status === 'success' ? 'bg-green-100 text-green-700' :
+                        'bg-red-100 text-red-700'
+                      }`}>
+                        {step.status}
+                      </span>
+                      {computeMode === 'classic' && !manualRunning && (
+                        <button
+                          onClick={() => setExpandedStepConfig(expandedStepConfig === i ? null : i)}
+                          className="text-[10px] text-slate-400 hover:text-slate-600 underline"
+                        >
+                          {expandedStepConfig === i ? 'Hide' : 'Config'}
+                        </button>
+                      )}
+                      {!manualRunning && (
+                        <button
+                          onClick={() => handleRunSingleStep(i)}
+                          className="text-[10px] font-medium px-2 py-0.5 rounded border bg-orange-50 border-orange-200 text-orange-600 hover:bg-orange-100 hover:border-orange-300 transition-all"
+                        >
+                          Run
+                        </button>
+                      )}
+                    </div>
                   </div>
-                  <div className="flex items-center gap-3">
-                    {step.duration_ms !== null && (
-                      <span className="text-xs font-mono text-slate-500">{formatDuration(step.duration_ms)}</span>
-                    )}
-                    {manualCosts[i] && (
-                      <span className="text-xs font-mono text-orange-600">{formatCost(manualCosts[i]!.total_cost_usd)}</span>
-                    )}
-                    {step.link && (
-                      <a
-                        href={step.link}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="text-xs text-orange-600 hover:text-orange-700 underline"
-                      >
-                        View Run
-                      </a>
-                    )}
-                    <span className={`text-[10px] font-medium uppercase px-2 py-0.5 rounded ${
-                      step.status === 'pending' ? 'bg-slate-200 text-slate-500' :
-                      step.status === 'running' ? 'bg-blue-100 text-blue-700' :
-                      step.status === 'success' ? 'bg-green-100 text-green-700' :
-                      'bg-red-100 text-red-700'
-                    }`}>
-                      {step.status}
-                    </span>
-                    {!manualRunning && (
-                      <button
-                        onClick={() => handleRunSingleStep(i)}
-                        className="text-[10px] font-medium px-2 py-0.5 rounded border bg-orange-50 border-orange-200 text-orange-600 hover:bg-orange-100 hover:border-orange-300 transition-all"
-                      >
-                        Run
-                      </button>
-                    )}
-                  </div>
+                  {step.output && (
+                    <p className="mt-2 text-xs text-slate-600 ml-10 break-words">{step.output}</p>
+                  )}
                 </div>
-                {step.output && (
-                  <p className="mt-2 text-xs text-slate-600 ml-10 break-words">{step.output}</p>
+
+                {/* Expandable per-step cluster config — classic mode only */}
+                {computeMode === 'classic' && expandedStepConfig === i && !manualRunning && (
+                  <div className="px-4 pb-4 pt-0">
+                    <div className="ml-10 p-3 bg-white rounded-lg border border-slate-200">
+                      <p className="text-[10px] text-slate-500 uppercase font-semibold mb-2">Cluster Configuration</p>
+                      <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+                        <FormField label="Spark Version">
+                          <SelectInput
+                            value={stepConfigs[i].sparkVersion}
+                            onChange={v => updateStepConfig(i, { sparkVersion: v })}
+                            options={[
+                              { value: '17.3.x-scala2.13', label: '17.3 LTS' },
+                              { value: '17.3.x-photon-scala2.13', label: '17.3 Photon' },
+                              { value: '17.2.x-scala2.13', label: '17.2' },
+                            ]}
+                          />
+                        </FormField>
+                        <FormField label="Worker Node Type">
+                          <SelectInput value={stepConfigs[i].workerNodeType} onChange={v => updateStepConfig(i, { workerNodeType: v })} options={gcpNodeTypes} />
+                        </FormField>
+                        <FormField label="Driver Node Type">
+                          <SelectInput value={stepConfigs[i].driverNodeType} onChange={v => updateStepConfig(i, { driverNodeType: v })} options={gcpNodeTypes} />
+                        </FormField>
+                        <FormField label="Workers">
+                          <NumberInput value={stepConfigs[i].numWorkers} onChange={v => updateStepConfig(i, { numWorkers: v })} min={1} max={100} />
+                        </FormField>
+                        <FormField label="Local SSDs">
+                          <NumberInput value={stepConfigs[i].localSsds} onChange={v => updateStepConfig(i, { localSsds: v })} min={0} max={8} />
+                        </FormField>
+                      </div>
+                    </div>
+                  </div>
                 )}
               </div>
             ))}

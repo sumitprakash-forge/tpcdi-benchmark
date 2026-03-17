@@ -275,6 +275,11 @@ except Exception as _e:
     print(f"[dataproc] Reconciliation skipped: {_e}")
 
 
+async def restore_active_dataproc_runs():
+    """Async entry point called from app lifespan. Reconciliation already ran at import."""
+    pass
+
+
 def _next_run_id() -> str:
     global _run_counter
     _run_counter += 1

@@ -178,12 +178,14 @@ class JobCreateRequest(BaseModel):
     log_detailed_stats: bool = True
     job_id: Optional[int] = None
     admin_token: str = ""  # PAT token — job runs as this user
+    workspace_url: str = ""  # Target workspace URL (overrides app's own host)
     compute_mode: str = "classic"  # "classic" or "serverless"
 
 
 class RunJobRequest(BaseModel):
     job_id: int
     admin_token: str = ""  # PAT token — job runs as this user
+    workspace_url: str = ""  # Target workspace URL
 
 
 class PrerequisitesRequest(BaseModel):
@@ -194,6 +196,7 @@ class PrerequisitesRequest(BaseModel):
     sa_email: str = ""
     sa_key_json: str = ""
     admin_token: str = ""  # Optional admin PAT for granting SP permissions
+    workspace_url: str = ""  # Target workspace URL
 
 
 # ── Check Prerequisites (GET - read-only status) ─────────────────────────
@@ -276,9 +279,15 @@ async def verify_prerequisites(req: PrerequisitesRequest, request: Request):
         import urllib.request
         import urllib.error
 
-        ws_host = os.environ.get("DATABRICKS_HOST", "")
-        if ws_host and not ws_host.startswith("http"):
-            ws_host = f"https://{ws_host}"
+        # Use provided workspace_url if present, otherwise fall back to app's own host
+        if req.workspace_url:
+            ws_host = req.workspace_url.strip().rstrip("/")
+            if ws_host and not ws_host.startswith("http"):
+                ws_host = f"https://{ws_host}"
+        else:
+            ws_host = os.environ.get("DATABRICKS_HOST", "")
+            if ws_host and not ws_host.startswith("http"):
+                ws_host = f"https://{ws_host}"
         admin_token = req.admin_token.strip() if req.admin_token else ""
 
         def _admin_api(method: str, path: str, body: dict = None) -> dict:
@@ -1054,7 +1063,7 @@ async def create_datagen_job(req: DataGenJobRequest, request: Request):
 @router.post("/databricks/create-job")
 async def create_job(req: JobCreateRequest, request: Request):
     try:
-        w = get_workspace_client_with_token(req.admin_token) if req.admin_token else get_workspace_client(request)
+        w = get_workspace_client_with_token(req.admin_token, req.workspace_url) if req.admin_token else get_workspace_client(request)
 
         jar_path = req.jar_path
         if not jar_path:
@@ -1161,7 +1170,7 @@ async def create_job(req: JobCreateRequest, request: Request):
 @router.post("/databricks/run-job")
 async def run_job(req: RunJobRequest, request: Request):
     try:
-        w = get_workspace_client_with_token(req.admin_token) if req.admin_token else get_workspace_client(request)
+        w = get_workspace_client_with_token(req.admin_token, req.workspace_url) if req.admin_token else get_workspace_client(request)
         wait = w.jobs.run_now(job_id=req.job_id)
         run_id = wait.run_id
         # Build run_page_url from workspace host
@@ -1176,9 +1185,9 @@ async def run_job(req: RunJobRequest, request: Request):
 # ── Job Status ──────────────────────────────────────────────────────────────
 
 @router.get("/databricks/job-status/{run_id}")
-async def get_job_status(run_id: int, request: Request, admin_token: str = Query("")):
+async def get_job_status(run_id: int, request: Request, admin_token: str = Query(""), workspace_url: str = Query("")):
     try:
-        w = get_workspace_client_with_token(admin_token) if admin_token else get_workspace_client(request)
+        w = get_workspace_client_with_token(admin_token, workspace_url) if admin_token else get_workspace_client(request)
         run = w.jobs.get_run(run_id=run_id)
 
         state = run.state
@@ -1410,10 +1419,10 @@ async def _list_metrics_dbfs(w, metrics_path: str):
 # ── Run Cost Calculation ──────────────────────────────────────────────────
 
 @router.get("/databricks/run-cost/{run_id}")
-async def get_run_cost(run_id: int, request: Request, admin_token: str = Query("")):
+async def get_run_cost(run_id: int, request: Request, admin_token: str = Query(""), workspace_url: str = Query("")):
     """Calculate cost breakdown for a completed job run."""
     try:
-        w = get_workspace_client_with_token(admin_token) if admin_token else get_workspace_client(request)
+        w = get_workspace_client_with_token(admin_token, workspace_url) if admin_token else get_workspace_client(request)
         # Get run details via REST API for raw JSON access
         run_data = w.api_client.do("GET", "/api/2.1/jobs/runs/get", query={"run_id": run_id})
 
@@ -1470,10 +1479,10 @@ async def get_run_cost(run_id: int, request: Request, admin_token: str = Query("
 # ── Cancel Run ────────────────────────────────────────────────────────────
 
 @router.post("/databricks/cancel-run/{run_id}")
-async def cancel_run(run_id: int, request: Request, admin_token: str = Query("")):
+async def cancel_run(run_id: int, request: Request, admin_token: str = Query(""), workspace_url: str = Query("")):
     """Cancel a running job."""
     try:
-        w = get_workspace_client_with_token(admin_token) if admin_token else get_workspace_client(request)
+        w = get_workspace_client_with_token(admin_token, workspace_url) if admin_token else get_workspace_client(request)
         w.jobs.cancel_run(run_id=run_id)
         return {"status": "cancelled", "run_id": run_id}
     except Exception as e:
@@ -1505,13 +1514,14 @@ async def delete_run_history(filename: str, request: Request):
 
 class ResolveTokenRequest(BaseModel):
     token: str
+    workspace_url: str = ""
 
 
 @router.post("/databricks/resolve-token")
 async def resolve_token(req: ResolveTokenRequest, request: Request):
     """Resolve a PAT token to user info by calling SCIM Me endpoint."""
     try:
-        w = get_workspace_client_with_token(req.token)
+        w = get_workspace_client_with_token(req.token, req.workspace_url)
         me = w.current_user.me()
         return {
             "status": "ok",
