@@ -1111,6 +1111,9 @@ async def create_job(req: JobCreateRequest, request: Request):
 
         if req.compute_mode == "serverless":
             # Serverless: no job_clusters; environments block enables serverless execution
+            # JAR libraries are not supported at task level for serverless — pass jar_path
+            # as a base_parameter so the notebook can load it via sc.addJar() if needed
+            base_parameters["jar_path"] = jar_path
             job_settings = {
                 "name": req.job_name,
                 "environments": [
@@ -1126,7 +1129,6 @@ async def create_job(req: JobCreateRequest, request: Request):
                     {
                         "task_key": "benchmark_execution",
                         "environment_key": "Default",
-                        "libraries": [{"jar": jar_path}],
                         "notebook_task": {
                             "notebook_path": req.notebook_path or _resolve_notebook_path(w, "benchmark_databricks_notebook"),
                             "base_parameters": base_parameters,
