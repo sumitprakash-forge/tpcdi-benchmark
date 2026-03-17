@@ -123,6 +123,7 @@ interface E2EStep {
 }
 
 interface RunCost {
+  compute_mode: 'classic' | 'serverless'
   vm_cost_usd: number
   dbu_cost_usd: number
   dbu_list_price: number
@@ -139,7 +140,7 @@ interface RunCost {
     worker_node_type: string
     num_workers: number
     local_ssd_count: number
-  }
+  } | null
 }
 
 interface E2ERunSizing {
@@ -1456,30 +1457,37 @@ export default function DatabricksTab() {
                   const labels = ['Batch', 'Incremental Batch 2', 'Incremental Batch 3']
                   return (
                     <div key={ci} className="p-4 bg-gradient-to-r from-slate-50 to-blue-50 rounded-lg border border-slate-200">
-                      <h4 className="text-sm font-bold text-slate-700 mb-3">{labels[ci]} (SF {e2eSF})</h4>
+                      <h4 className="text-sm font-bold text-slate-700 mb-3">
+                        {labels[ci]} (SF {e2eSF}){cost.compute_mode === 'serverless' ? ' — Serverless' : ''}
+                      </h4>
                       <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-                        <div className="bg-white rounded-lg p-2.5 border border-slate-100">
-                          <p className="text-[10px] text-slate-500 uppercase">VM Compute</p>
-                          <p className="text-base font-bold text-slate-800">{formatCost(cost.vm_cost_usd)}</p>
-                        </div>
+                        {cost.compute_mode !== 'serverless' && (
+                          <div className="bg-white rounded-lg p-2.5 border border-slate-100">
+                            <p className="text-[10px] text-slate-500 uppercase">VM Compute</p>
+                            <p className="text-base font-bold text-slate-800">{formatCost(cost.vm_cost_usd)}</p>
+                          </div>
+                        )}
                         <div className="bg-white rounded-lg p-2.5 border border-slate-100">
                           <p className="text-[10px] text-slate-500 uppercase">DBU Cost</p>
                           <p className="text-base font-bold text-slate-800">{formatCost(cost.dbu_cost_usd)}</p>
-                          <p className="text-[9px] text-slate-400">{cost.total_dbus} DBUs @ {formatCost(cost.dbu_list_price)}/DBU</p>
+                          <p className="text-[9px] text-slate-400">{cost.total_dbus} DBUs @ {formatCost(cost.dbu_list_price)}/DBU{cost.compute_mode === 'serverless' ? ' (est.)' : ''}</p>
                         </div>
-                        <div className="bg-white rounded-lg p-2.5 border border-slate-100">
-                          <p className="text-[10px] text-slate-500 uppercase">Local SSD</p>
-                          <p className="text-base font-bold text-slate-800">{formatCost(cost.ssd_cost_usd)}</p>
-                          <p className="text-[9px] text-slate-400">{cost.cluster.local_ssd_count} SSD(s)</p>
-                        </div>
+                        {cost.compute_mode !== 'serverless' && (
+                          <div className="bg-white rounded-lg p-2.5 border border-slate-100">
+                            <p className="text-[10px] text-slate-500 uppercase">Local SSD</p>
+                            <p className="text-base font-bold text-slate-800">{formatCost(cost.ssd_cost_usd)}</p>
+                            <p className="text-[9px] text-slate-400">{cost.cluster?.local_ssd_count} SSD(s)</p>
+                          </div>
+                        )}
                         <div className="bg-white rounded-lg p-2.5 border border-orange-200 bg-orange-50">
-                          <p className="text-[10px] text-orange-600 uppercase font-semibold">Total</p>
+                          <p className="text-[10px] text-orange-600 uppercase font-semibold">Total{cost.compute_mode === 'serverless' ? ' (est.)' : ''}</p>
                           <p className="text-base font-bold text-orange-700">{formatCost(cost.total_cost_usd)}</p>
                         </div>
                         <div className="bg-white rounded-lg p-2.5 border border-slate-100">
                           <p className="text-[10px] text-slate-500 uppercase">Duration</p>
                           <p className="text-sm font-mono text-slate-700">{formatDuration(cost.duration_ms)}</p>
-                          <p className="text-[9px] text-slate-400">{cost.cluster.worker_node_type} x{cost.cluster.num_workers}</p>
+                          {cost.cluster && <p className="text-[9px] text-slate-400">{cost.cluster.worker_node_type} x{cost.cluster.num_workers}</p>}
+                          {cost.compute_mode === 'serverless' && <p className="text-[9px] text-purple-500">Serverless</p>}
                         </div>
                       </div>
                       {cost.run_page_url && (
@@ -1901,30 +1909,37 @@ export default function DatabricksTab() {
                 const labels = ['Batch Load', 'Incremental Batch 2', 'Incremental Batch 3']
                 return (
                   <div key={ci} className="p-4 bg-gradient-to-r from-slate-50 to-blue-50 rounded-lg border border-slate-200">
-                    <h4 className="text-sm font-bold text-slate-700 mb-3">{labels[ci]} (SF {scaleFactor})</h4>
+                    <h4 className="text-sm font-bold text-slate-700 mb-3">
+                      {labels[ci]} (SF {scaleFactor}){cost.compute_mode === 'serverless' ? ' — Serverless' : ''}
+                    </h4>
                     <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-                      <div className="bg-white rounded-lg p-2.5 border border-slate-100">
-                        <p className="text-[10px] text-slate-500 uppercase">VM Compute</p>
-                        <p className="text-base font-bold text-slate-800">{formatCost(cost.vm_cost_usd)}</p>
-                      </div>
+                      {cost.compute_mode !== 'serverless' && (
+                        <div className="bg-white rounded-lg p-2.5 border border-slate-100">
+                          <p className="text-[10px] text-slate-500 uppercase">VM Compute</p>
+                          <p className="text-base font-bold text-slate-800">{formatCost(cost.vm_cost_usd)}</p>
+                        </div>
+                      )}
                       <div className="bg-white rounded-lg p-2.5 border border-slate-100">
                         <p className="text-[10px] text-slate-500 uppercase">DBU Cost</p>
                         <p className="text-base font-bold text-slate-800">{formatCost(cost.dbu_cost_usd)}</p>
-                        <p className="text-[9px] text-slate-400">{cost.total_dbus} DBUs @ {formatCost(cost.dbu_list_price)}/DBU</p>
+                        <p className="text-[9px] text-slate-400">{cost.total_dbus} DBUs @ {formatCost(cost.dbu_list_price)}/DBU{cost.compute_mode === 'serverless' ? ' (est.)' : ''}</p>
                       </div>
-                      <div className="bg-white rounded-lg p-2.5 border border-slate-100">
-                        <p className="text-[10px] text-slate-500 uppercase">Local SSD</p>
-                        <p className="text-base font-bold text-slate-800">{formatCost(cost.ssd_cost_usd)}</p>
-                        <p className="text-[9px] text-slate-400">{cost.cluster.local_ssd_count} SSD(s)</p>
-                      </div>
+                      {cost.compute_mode !== 'serverless' && (
+                        <div className="bg-white rounded-lg p-2.5 border border-slate-100">
+                          <p className="text-[10px] text-slate-500 uppercase">Local SSD</p>
+                          <p className="text-base font-bold text-slate-800">{formatCost(cost.ssd_cost_usd)}</p>
+                          <p className="text-[9px] text-slate-400">{cost.cluster?.local_ssd_count} SSD(s)</p>
+                        </div>
+                      )}
                       <div className="bg-white rounded-lg p-2.5 border border-orange-200 bg-orange-50">
-                        <p className="text-[10px] text-orange-600 uppercase font-semibold">Total</p>
+                        <p className="text-[10px] text-orange-600 uppercase font-semibold">Total{cost.compute_mode === 'serverless' ? ' (est.)' : ''}</p>
                         <p className="text-base font-bold text-orange-700">{formatCost(cost.total_cost_usd)}</p>
                       </div>
                       <div className="bg-white rounded-lg p-2.5 border border-slate-100">
                         <p className="text-[10px] text-slate-500 uppercase">Duration</p>
                         <p className="text-sm font-mono text-slate-700">{formatDuration(cost.duration_ms)}</p>
-                        <p className="text-[9px] text-slate-400">{cost.cluster.worker_node_type} x{cost.cluster.num_workers}</p>
+                        {cost.cluster && <p className="text-[9px] text-slate-400">{cost.cluster.worker_node_type} x{cost.cluster.num_workers}</p>}
+                        {cost.compute_mode === 'serverless' && <p className="text-[9px] text-purple-500">Serverless</p>}
                       </div>
                     </div>
                     {cost.run_page_url && (

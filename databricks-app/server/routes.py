@@ -53,6 +53,8 @@ GCP_VM_PRICING = {
 }
 DBU_LIST_PRICE = 0.15  # $/DBU for Jobs Compute (Photon)
 LOCAL_SSD_COST_PER_HR = 0.0416  # per 375GB SSD per hour
+SERVERLESS_DBU_PRICE = 0.70    # $/DBU for Serverless (Standard tier)
+SERVERLESS_DBU_PER_HR = 4.0   # approximate DBU/hr for a serverless job task
 
 
 def _get_instance_pricing(instance_type: str) -> dict:
@@ -81,7 +83,7 @@ def calculate_run_cost(
     local_ssd_count: int = 0,
     photon: bool = True,
 ) -> dict:
-    """Calculate cost breakdown for a job run."""
+    """Calculate cost breakdown for a classic cluster job run."""
     hours = duration_ms / 3_600_000.0
     driver_p = _get_instance_pricing(driver_type)
     worker_p = _get_instance_pricing(worker_type)
@@ -93,6 +95,7 @@ def calculate_run_cost(
     ssd_cost = local_ssd_count * total_nodes * LOCAL_SSD_COST_PER_HR * hours
 
     return {
+        "compute_mode": "classic",
         "vm_cost_usd": round(vm_cost, 4),
         "dbu_cost_usd": round(dbu_cost, 4),
         "dbu_list_price": DBU_LIST_PRICE,
@@ -107,6 +110,30 @@ def calculate_run_cost(
             "num_workers": num_workers,
             "local_ssd_count": local_ssd_count,
         },
+    }
+
+
+def calculate_serverless_cost(duration_ms: int) -> dict:
+    """Estimate cost for a serverless job run.
+
+    Serverless billing is via system tables; this is an estimate based on
+    standard Serverless DBU rate and ~4 DBU/hr consumption.
+    """
+    hours = duration_ms / 3_600_000.0
+    total_dbu = SERVERLESS_DBU_PER_HR * hours
+    dbu_cost = total_dbu * SERVERLESS_DBU_PRICE
+
+    return {
+        "compute_mode": "serverless",
+        "vm_cost_usd": 0.0,
+        "dbu_cost_usd": round(dbu_cost, 4),
+        "dbu_list_price": SERVERLESS_DBU_PRICE,
+        "total_dbus": round(total_dbu, 2),
+        "ssd_cost_usd": 0.0,
+        "total_cost_usd": round(dbu_cost, 4),
+        "duration_hours": round(hours, 4),
+        "duration_ms": duration_ms,
+        "cluster": None,
     }
 
 
@@ -1083,9 +1110,18 @@ async def create_job(req: JobCreateRequest, request: Request):
         }
 
         if req.compute_mode == "serverless":
-            # Serverless: use environment_key instead of new_cluster/job_clusters
+            # Serverless: no job_clusters; environments block enables serverless execution
             job_settings = {
                 "name": req.job_name,
+                "environments": [
+                    {
+                        "environment_key": "Default",
+                        "spec": {
+                            "client": "1",
+                            "dependencies": [],
+                        },
+                    }
+                ],
                 "tasks": [
                     {
                         "task_key": "benchmark_execution",
@@ -1434,33 +1470,29 @@ async def get_run_cost(run_id: int, request: Request, admin_token: str = Query("
         setup_duration = run_data.get("setup_duration", 0) or 0
         total_duration = exec_duration + setup_duration
 
-        # Extract cluster config from job_clusters
-        driver_type = "unknown"
-        worker_type = "unknown"
-        num_workers = 0
-        local_ssd_count = 0
-
+        # Detect compute mode: serverless runs have no job_clusters
         job_clusters = run_data.get("job_clusters", [])
-        if job_clusters:
+        is_serverless = len(job_clusters) == 0
+
+        if is_serverless:
+            cost = calculate_serverless_cost(duration_ms=total_duration)
+        else:
             cluster_spec = job_clusters[0].get("new_cluster", {})
             driver_type = cluster_spec.get("driver_node_type_id", cluster_spec.get("node_type_id", "unknown"))
             worker_type = cluster_spec.get("node_type_id", driver_type)
             num_workers = cluster_spec.get("num_workers", 0)
             gcp_attrs = cluster_spec.get("gcp_attributes", {})
-            local_ssd_count = gcp_attrs.get("local_ssd_count", 1)  # GCP default: 1 local SSD per node
+            local_ssd_count = gcp_attrs.get("local_ssd_count", 1)
+            photon = cluster_spec.get("runtime_engine", "") == "PHOTON"
 
-        photon = False
-        if job_clusters:
-            photon = job_clusters[0].get("new_cluster", {}).get("runtime_engine", "") == "PHOTON"
-
-        cost = calculate_run_cost(
-            driver_type=driver_type,
-            worker_type=worker_type,
-            num_workers=num_workers,
-            duration_ms=total_duration,
-            local_ssd_count=local_ssd_count,
-            photon=photon,
-        )
+            cost = calculate_run_cost(
+                driver_type=driver_type,
+                worker_type=worker_type,
+                num_workers=num_workers,
+                duration_ms=total_duration,
+                local_ssd_count=local_ssd_count,
+                photon=photon,
+            )
 
         cost["run_id"] = run_id
         cost["state"] = lifecycle
