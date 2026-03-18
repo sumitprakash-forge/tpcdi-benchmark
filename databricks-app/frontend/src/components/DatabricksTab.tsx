@@ -1282,6 +1282,9 @@ export default function DatabricksTab() {
               <FormField label="Catalog">
                 <input className="px-3 py-2 bg-white border border-slate-200 rounded-md text-sm font-mono text-slate-700" value={catalogName} onChange={e => setCatalogName(e.target.value)} />
               </FormField>
+              <FormField label="Schema">
+                <TextInput value={targetSchema} onChange={setTargetSchema} placeholder="dw" />
+              </FormField>
               <FormField label="Raw Data Path">
                 <div className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-md text-sm font-mono text-slate-700 max-w-[260px] truncate" title={rawDataPath}>{rawDataPath}</div>
               </FormField>

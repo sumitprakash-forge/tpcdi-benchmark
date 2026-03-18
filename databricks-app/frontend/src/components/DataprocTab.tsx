@@ -1320,6 +1320,9 @@ export default function DataprocTab() {
               <FormField label="Raw Data Path">
                 <div className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-md text-sm font-mono text-slate-700 max-w-[260px] truncate" title={rawDataPath}>{rawDataPath}</div>
               </FormField>
+              <FormField label="Target Database">
+                <TextInput value={targetDatabase} onChange={setTargetDatabase} placeholder="tpcdi_warehouse" />
+              </FormField>
               <FormField label="Dataproc Metastore">
                 <TextInput value={metastoreName} onChange={setMetastoreName} placeholder="tpcdi-benchmark-metastore" />
                 <p className="text-xs text-slate-500 mt-0.5">Creates if not exists, reuses if already created</p>

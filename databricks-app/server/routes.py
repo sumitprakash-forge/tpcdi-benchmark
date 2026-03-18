@@ -1154,9 +1154,7 @@ async def create_job(req: JobCreateRequest, request: Request):
                 "driver_node_type_id": req.driver_node_type,
                 "runtime_engine": "PHOTON" if req.photon else "STANDARD",
                 "data_security_mode": "SINGLE_USER",
-                "spark_conf": {
-                    "spark.databricks.delta.optimizeWrite.enabled": "true",
-                },
+                "spark_conf": {},
                 "gcp_attributes": {
                     "use_preemptible_executors": False,
                     "local_ssd_count": req.local_ssds,
