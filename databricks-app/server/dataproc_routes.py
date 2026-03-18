@@ -1303,11 +1303,14 @@ async def _run_full_cycle_task(run_id: str, req: DataprocFullRunRequest):
         if not run.get("cluster_deleted_ms"):
             run["cluster_deleted_ms"] = int(time.time() * 1000)
 
+        # Cost excludes termination time — matches Databricks behavior.
+        # Use job_done_ms (end of execution) not cluster_deleted_ms (end of teardown).
+        billable_ms = run["job_done_ms"] - run["start_time_ms"]
         total_ms = run["cluster_deleted_ms"] - run["start_time_ms"]
         run["duration_ms"] = total_ms
         run["cost"] = calculate_dataproc_cost(
             master_type=req.master_type, worker_type=req.worker_type,
-            num_workers=req.num_workers, duration_ms=total_ms, ssd_count=req.ssd_count,
+            num_workers=req.num_workers, duration_ms=billable_ms, ssd_count=req.ssd_count,
         )
         # Report DONE even if cluster deletion failed – the job itself succeeded.
         run["state"] = "DONE"
