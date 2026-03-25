@@ -117,9 +117,11 @@ function getCostForStep(entry: RunHistoryEntry, stepIndex: number): RunHistoryCo
 
 interface RunHistorySectionProps {
   platform: 'databricks' | 'dataproc'
+  workspaceUrl?: string
+  adminToken?: string
 }
 
-export default function RunHistorySection({ platform }: RunHistorySectionProps) {
+export default function RunHistorySection({ platform, workspaceUrl = '', adminToken = '' }: RunHistorySectionProps) {
   const [entries, setEntries] = useState<RunHistoryEntry[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -131,7 +133,10 @@ export default function RunHistorySection({ platform }: RunHistorySectionProps) 
     setLoading(true)
     setError(null)
     try {
-      const res = await fetch('/api/databricks/run-history')
+      const params = new URLSearchParams()
+      if (workspaceUrl) params.set('workspace_url', workspaceUrl)
+      if (adminToken) params.set('admin_token', adminToken)
+      const res = await fetch(`/api/databricks/run-history?${params}`)
       const data = await res.json()
       if (!res.ok) throw new Error(data.detail || 'Failed to load run history')
       const all: RunHistoryEntry[] = Array.isArray(data) ? data : data.entries || []
@@ -145,7 +150,7 @@ export default function RunHistorySection({ platform }: RunHistorySectionProps) 
     }
   }
 
-  useEffect(() => { fetchHistory() }, [platform])
+  useEffect(() => { fetchHistory() }, [platform, workspaceUrl, adminToken])
 
   const handleFixStatus = async (entry: RunHistoryEntry) => {
     setFixing(entry._filename)
@@ -159,7 +164,7 @@ export default function RunHistorySection({ platform }: RunHistorySectionProps) 
       const res = await fetch(`/api/databricks/run-history/${encodeURIComponent(entry._filename)}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ updates: { status: allSuccess ? 'completed' : 'failed', steps: fixedSteps } }),
+        body: JSON.stringify({ workspace_url: workspaceUrl, admin_token: adminToken, updates: { status: allSuccess ? 'completed' : 'failed', steps: fixedSteps } }),
       })
       if (!res.ok) throw new Error('Fix failed')
       await fetchHistory()
@@ -174,7 +179,10 @@ export default function RunHistorySection({ platform }: RunHistorySectionProps) 
     if (!confirm('Delete this run history entry?')) return
     setDeleting(filename)
     try {
-      const res = await fetch(`/api/databricks/run-history/${encodeURIComponent(filename)}`, { method: 'DELETE' })
+      const params = new URLSearchParams()
+      if (workspaceUrl) params.set('workspace_url', workspaceUrl)
+      if (adminToken) params.set('admin_token', adminToken)
+      const res = await fetch(`/api/databricks/run-history/${encodeURIComponent(filename)}?${params}`, { method: 'DELETE' })
       if (!res.ok) {
         const data = await res.json()
         throw new Error(data.detail || 'Delete failed')

@@ -1581,32 +1581,40 @@ async def cancel_run(run_id: int, request: Request, admin_token: str = Query("")
 
 class SaveRunRequest(BaseModel):
     run_data: dict
+    workspace_url: str = ""
+    admin_token: str = ""
 
 
 @router.post("/databricks/save-run")
 async def save_run(req: SaveRunRequest, request: Request):
-    result = run_history.save_run(request, req.run_data)
+    w = _get_ws(req.workspace_url, req.admin_token, request)
+    result = run_history.save_run(request, req.run_data, w=w)
     return result
 
 
 @router.get("/databricks/run-history")
-async def list_run_history(request: Request, limit: int = Query(50)):
-    return run_history.list_runs(request, limit)
+async def list_run_history(request: Request, limit: int = Query(50), workspace_url: str = Query(""), admin_token: str = Query("")):
+    w = _get_ws(workspace_url, admin_token, request)
+    return run_history.list_runs(request, limit, w=w)
 
 
 @router.delete("/databricks/run-history/{filename}")
-async def delete_run_history(filename: str, request: Request):
-    return run_history.delete_run(request, filename)
+async def delete_run_history(filename: str, request: Request, workspace_url: str = Query(""), admin_token: str = Query("")):
+    w = _get_ws(workspace_url, admin_token, request)
+    return run_history.delete_run(request, filename, w=w)
 
 
 class PatchRunRequest(BaseModel):
     updates: dict  # Partial fields to merge into the saved run JSON
+    workspace_url: str = ""
+    admin_token: str = ""
 
 
 @router.patch("/databricks/run-history/{filename}")
 async def patch_run_history(filename: str, req: PatchRunRequest, request: Request):
     """Merge updates into an existing run history file."""
-    return run_history.patch_run(request, filename, req.updates)
+    w = _get_ws(req.workspace_url, req.admin_token, request)
+    return run_history.patch_run(request, filename, req.updates, w=w)
 
 
 class ResolveTokenRequest(BaseModel):

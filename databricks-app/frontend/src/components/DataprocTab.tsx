@@ -225,6 +225,10 @@ export default function DataprocTab() {
   const [_loadingAuth, setLoadingAuth] = useState(false)
 
 
+  // Databricks workspace URL and token (read from localStorage, set by DatabricksTab)
+  const dbWorkspaceUrl = localStorage.getItem('tpcdi_workspace_url') || ''
+  const dbAdminToken = localStorage.getItem('tpcdi_databricks_pat') || ''
+
   // Mandatory GCP refresh token (persisted in localStorage, auto-refreshes before every run)
   const [gcpRefreshToken, setGcpRefreshToken] = useState(() => localStorage.getItem('tpcdi_gcp_refresh_token') || '')
   const [gcpTokenUser, setGcpTokenUser] = useState<string | null>(null)
@@ -311,6 +315,8 @@ export default function DataprocTab() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
+        workspace_url: localStorage.getItem('tpcdi_workspace_url') || '',
+        admin_token: localStorage.getItem('tpcdi_databricks_pat') || '',
         run_data: {
           platform: 'dataproc',
           mode: 'e2e',
@@ -783,6 +789,35 @@ export default function DataprocTab() {
   }
 
   const [cancelling, setCancelling] = useState(false)
+  const [syncingE2E, setSyncingE2E] = useState(false)
+
+  async function handleForceSyncE2E() {
+    if (!e2eRunId || e2eActiveStep === null) return
+    setSyncingE2E(true)
+    try {
+      const status = await apiCall(`/api/dataproc/run-status/${e2eRunId}`)
+      if (status.state === 'DONE') {
+        updateE2EStep(e2eActiveStep, { status: 'success', output: `Force synced: DONE | Total: ${status.duration_ms ? Math.round(status.duration_ms / 1000) + 's' : 'N/A'}`, duration_ms: status.duration_ms })
+        if (status.cost) setRunCosts(prev => { const next = [...prev]; next[e2eActiveStep - 1] = status.cost; return next })
+        setE2eRunId(null)
+        setE2eRunning(false)
+        setE2eActiveStep(null)
+        setE2eRemainingSpecs([])
+      } else if (status.state === 'ERROR' || status.state === 'CANCELLED') {
+        updateE2EStep(e2eActiveStep, { status: 'error', output: `Force synced: ${status.state} — ${status.error || 'Unknown error'}` })
+        setE2eRunId(null)
+        setE2eRunning(false)
+        setE2eActiveStep(null)
+        setE2eRemainingSpecs([])
+      } else {
+        addToast(`Job still running (phase: ${status.phase})`, 'info')
+      }
+    } catch (e: any) {
+      addToast(`Force sync failed: ${e.message}`, 'error')
+    } finally {
+      setSyncingE2E(false)
+    }
+  }
 
   async function handleCancelE2E() {
     if (!e2eRunId) return
@@ -1335,13 +1370,22 @@ export default function DataprocTab() {
                 variant="secondary"
               />
               {e2eRunning && e2eRunId && e2eRunId !== 'pending' && (
-                <button
-                  onClick={handleCancelE2E}
-                  disabled={cancelling}
-                  className="px-4 py-2 text-sm font-medium rounded-md border border-red-300 text-red-600 hover:bg-red-50 disabled:opacity-50 transition-all"
-                >
-                  {cancelling ? 'Cancelling...' : 'Cancel Run'}
-                </button>
+                <>
+                  <button
+                    onClick={handleForceSyncE2E}
+                    disabled={syncingE2E}
+                    className="px-4 py-2 text-sm font-medium rounded-md border border-blue-300 text-blue-600 hover:bg-blue-50 disabled:opacity-50 transition-all"
+                  >
+                    {syncingE2E ? 'Syncing...' : 'Force Sync Status'}
+                  </button>
+                  <button
+                    onClick={handleCancelE2E}
+                    disabled={cancelling}
+                    className="px-4 py-2 text-sm font-medium rounded-md border border-red-300 text-red-600 hover:bg-red-50 disabled:opacity-50 transition-all"
+                  >
+                    {cancelling ? 'Cancelling...' : 'Cancel Run'}
+                  </button>
+                </>
               )}
             </div>
 
@@ -1983,7 +2027,7 @@ export default function DataprocTab() {
       )}
 
       {/* Run History */}
-      <RunHistorySection platform="dataproc" />
+      <RunHistorySection platform="dataproc" workspaceUrl={dbWorkspaceUrl} adminToken={dbAdminToken} />
     </div>
   )
 }

@@ -18,9 +18,10 @@ def _get_runs_path(w, user_email: str = "") -> str:
         identity = user_email or "sumit.prakash@databricks.com"
     return f"/Workspace/Users/{identity}/tpcdi-benchmark/runs"
 
-def save_run(request: Request, run_data: dict) -> dict:
+def save_run(request: Request, run_data: dict, w=None) -> dict:
     try:
-        w = get_workspace_client(request)
+        if w is None:
+            w = get_workspace_client(request)
         user_email = get_user_email(request)
         runs_path = _get_runs_path(w, user_email)
         run_id = run_data.get("run_id") or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -53,9 +54,10 @@ def save_run(request: Request, run_data: dict) -> dict:
         traceback.print_exc()
         return {"status": "error", "message": str(e)}
 
-def list_runs(request: Request, limit: int = 50) -> list:
+def list_runs(request: Request, limit: int = 50, w=None) -> list:
     try:
-        w = get_workspace_client(request)
+        if w is None:
+            w = get_workspace_client(request)
         user_email = get_user_email(request)
         runs_path = _get_runs_path(w, user_email)
         try:
@@ -85,10 +87,11 @@ def list_runs(request: Request, limit: int = 50) -> list:
         traceback.print_exc()
         return []
 
-def patch_run(request: Request, filename: str, updates: dict) -> dict:
+def patch_run(request: Request, filename: str, updates: dict, w=None) -> dict:
     """Merge updates into an existing run history file."""
     try:
-        w = get_workspace_client(request)
+        if w is None:
+            w = get_workspace_client(request)
         user_email = get_user_email(request)
         runs_path = _get_runs_path(w, user_email)
         file_path = f"{runs_path}/{filename}"
@@ -114,9 +117,10 @@ def patch_run(request: Request, filename: str, updates: dict) -> dict:
         return {"status": "error", "message": str(e)}
 
 
-def delete_run(request: Request, filename: str) -> dict:
+def delete_run(request: Request, filename: str, w=None) -> dict:
     try:
-        w = get_workspace_client(request)
+        if w is None:
+            w = get_workspace_client(request)
         user_email = get_user_email(request)
         runs_path = _get_runs_path(w, user_email)
         file_path = f"{runs_path}/{filename}"

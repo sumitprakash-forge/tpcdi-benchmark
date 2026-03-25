@@ -426,6 +426,8 @@ export default function DatabricksTab() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
+        workspace_url: workspaceUrl,
+        admin_token: adminToken,
         run_data: {
           platform: 'databricks',
           mode: 'e2e',
@@ -453,6 +455,8 @@ export default function DatabricksTab() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
+        workspace_url: workspaceUrl,
+        admin_token: adminToken,
         run_data: {
           platform: 'databricks',
           mode: 'manual',
@@ -1908,7 +1912,7 @@ export default function DatabricksTab() {
       )}
 
       {/* Run History */}
-      <RunHistorySection platform="databricks" />
+      <RunHistorySection platform="databricks" workspaceUrl={workspaceUrl} adminToken={adminToken} />
     </div>
   )
 }
