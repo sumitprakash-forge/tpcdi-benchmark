@@ -7,7 +7,16 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from databricks.sdk import WorkspaceClient
-from server.config import get_workspace_client, get_workspace_client_with_token, get_user_email
+from server.config import get_workspace_client, get_workspace_client_with_token, get_workspace_client_with_host, get_user_email
+
+
+def _get_ws(workspace_url: str, token: str, request):
+    """Pick the right WorkspaceClient based on what's provided."""
+    if workspace_url and token:
+        return get_workspace_client_with_host(token, workspace_url)
+    if token:
+        return get_workspace_client_with_token(token)
+    return get_workspace_client(request)
 from server import run_history
 
 router = APIRouter()
@@ -53,8 +62,6 @@ GCP_VM_PRICING = {
 }
 DBU_LIST_PRICE = 0.15  # $/DBU for Jobs Compute (Photon)
 LOCAL_SSD_COST_PER_HR = 0.0416  # per 375GB SSD per hour
-SERVERLESS_DBU_PRICE = 0.70    # $/DBU for Serverless (Standard tier)
-SERVERLESS_DBU_PER_HR = 4.0   # approximate DBU/hr for a serverless job task
 
 
 def _get_instance_pricing(instance_type: str) -> dict:
@@ -83,7 +90,7 @@ def calculate_run_cost(
     local_ssd_count: int = 0,
     photon: bool = True,
 ) -> dict:
-    """Calculate cost breakdown for a classic cluster job run."""
+    """Calculate cost breakdown for a job run."""
     hours = duration_ms / 3_600_000.0
     driver_p = _get_instance_pricing(driver_type)
     worker_p = _get_instance_pricing(worker_type)
@@ -95,7 +102,6 @@ def calculate_run_cost(
     ssd_cost = local_ssd_count * total_nodes * LOCAL_SSD_COST_PER_HR * hours
 
     return {
-        "compute_mode": "classic",
         "vm_cost_usd": round(vm_cost, 4),
         "dbu_cost_usd": round(dbu_cost, 4),
         "dbu_list_price": DBU_LIST_PRICE,
@@ -110,30 +116,6 @@ def calculate_run_cost(
             "num_workers": num_workers,
             "local_ssd_count": local_ssd_count,
         },
-    }
-
-
-def calculate_serverless_cost(duration_ms: int) -> dict:
-    """Estimate cost for a serverless job run.
-
-    Serverless billing is via system tables; this is an estimate based on
-    standard Serverless DBU rate and ~4 DBU/hr consumption.
-    """
-    hours = duration_ms / 3_600_000.0
-    total_dbu = SERVERLESS_DBU_PER_HR * hours
-    dbu_cost = total_dbu * SERVERLESS_DBU_PRICE
-
-    return {
-        "compute_mode": "serverless",
-        "vm_cost_usd": 0.0,
-        "dbu_cost_usd": round(dbu_cost, 4),
-        "dbu_list_price": SERVERLESS_DBU_PRICE,
-        "total_dbus": round(total_dbu, 2),
-        "ssd_cost_usd": 0.0,
-        "total_cost_usd": round(dbu_cost, 4),
-        "duration_hours": round(hours, 4),
-        "duration_ms": duration_ms,
-        "cluster": None,
     }
 
 
@@ -205,14 +187,14 @@ class JobCreateRequest(BaseModel):
     log_detailed_stats: bool = True
     job_id: Optional[int] = None
     admin_token: str = ""  # PAT token — job runs as this user
-    workspace_url: str = ""  # Target workspace URL (overrides app's own host)
     compute_mode: str = "classic"  # "classic" or "serverless"
+    workspace_url: str = ""  # Optional — overrides CLI profile host
 
 
 class RunJobRequest(BaseModel):
     job_id: int
     admin_token: str = ""  # PAT token — job runs as this user
-    workspace_url: str = ""  # Target workspace URL
+    workspace_url: str = ""  # Optional — overrides CLI profile host
 
 
 class PrerequisitesRequest(BaseModel):
@@ -223,7 +205,7 @@ class PrerequisitesRequest(BaseModel):
     sa_email: str = ""
     sa_key_json: str = ""
     admin_token: str = ""  # Optional admin PAT for granting SP permissions
-    workspace_url: str = ""  # Target workspace URL
+    workspace_url: str = ""  # Optional — overrides CLI profile host
 
 
 # ── Check Prerequisites (GET - read-only status) ─────────────────────────
@@ -234,10 +216,12 @@ async def check_prerequisites(
     catalog_name: str = Query("tpcdi_benchmark"),
     schema_name: str = Query("dw"),
     raw_data_path: str = Query("gs://sumit_prakash_gcs/tpcdi"),
+    workspace_url: str = Query(""),
+    admin_token: str = Query(""),
 ):
     """Check existence of catalog, credential, external location, schema, volume."""
     try:
-        w = get_workspace_client(request)
+        w = _get_ws(workspace_url, admin_token, request)
         cred_name = f"{catalog_name}_cred"
         ext_loc_name = f"{catalog_name}_raw_data"
         volume_name = "libs"
@@ -297,7 +281,7 @@ async def verify_prerequisites(req: PrerequisitesRequest, request: Request):
     catalog grants, metastore grants) that the SP can't do for itself.
     """
     try:
-        w = get_workspace_client(request)
+        w = _get_ws(req.workspace_url, req.admin_token, request)
         cred_name = req.catalog_name
         ext_loc_name = f"{req.catalog_name}_raw_data"
         volume_name = "libs"
@@ -306,15 +290,9 @@ async def verify_prerequisites(req: PrerequisitesRequest, request: Request):
         import urllib.request
         import urllib.error
 
-        # Use provided workspace_url if present, otherwise fall back to app's own host
-        if req.workspace_url:
-            ws_host = req.workspace_url.strip().rstrip("/")
-            if ws_host and not ws_host.startswith("http"):
-                ws_host = f"https://{ws_host}"
-        else:
-            ws_host = os.environ.get("DATABRICKS_HOST", "")
-            if ws_host and not ws_host.startswith("http"):
-                ws_host = f"https://{ws_host}"
+        ws_host = os.environ.get("DATABRICKS_HOST", "")
+        if ws_host and not ws_host.startswith("http"):
+            ws_host = f"https://{ws_host}"
         admin_token = req.admin_token.strip() if req.admin_token else ""
 
         def _admin_api(method: str, path: str, body: dict = None) -> dict:
@@ -408,9 +386,18 @@ async def verify_prerequisites(req: PrerequisitesRequest, request: Request):
 
         if not catalog_exists:
             try:
+                # Derive storage root: use explicit value, or fall back to raw_data_path bucket/{catalog_name}
+                storage_root = None
+                if req.storage_root and req.storage_root not in ("gs://", "gs://.", ""):
+                    storage_root = req.storage_root
+                elif req.raw_data_path and req.raw_data_path.startswith("gs://"):
+                    # Extract bucket from raw_data_path (gs://bucket/path -> gs://bucket/catalog_name)
+                    parts = req.raw_data_path.rstrip("/").split("/")
+                    bucket = "/".join(parts[:3])  # gs://bucket-name
+                    storage_root = f"{bucket}/{req.catalog_name}"
                 w.catalogs.create(
                     name=req.catalog_name,
-                    storage_root=req.storage_root if req.storage_root != "gs://" else None,
+                    storage_root=storage_root,
                     comment="TPC-DI benchmark catalog",
                 )
                 catalog_exists = True
@@ -579,7 +566,7 @@ async def verify_prerequisites(req: PrerequisitesRequest, request: Request):
             # Also grant to the admin token user (PAT user who will run jobs)
             if admin_token:
                 try:
-                    pat_w = get_workspace_client_with_token(admin_token)
+                    pat_w = _get_ws(req.workspace_url, admin_token, request)
                     pat_me = pat_w.current_user.me()
                     pat_user = pat_me.user_name or ""
                     if pat_user and pat_user not in grant_principals:
@@ -820,6 +807,8 @@ async def grant_gcs_iam(req: GcsIamGrantRequest):
 class BootstrapRequest(BaseModel):
     catalog_name: str = "tpcdi_benchmark"
     schema_name: str = "dw"
+    workspace_url: str = ""  # Optional — overrides CLI profile host
+    admin_token: str = ""  # Optional PAT
 
 
 @router.post("/databricks/bootstrap")
@@ -832,7 +821,7 @@ async def bootstrap_workspace(req: BootstrapRequest, request: Request):
     If files already exist at the SP path, skip the copy.
     """
     try:
-        w = get_workspace_client(request)
+        w = _get_ws(req.workspace_url, req.admin_token, request)
         user_email = get_user_email(request)
         steps = []
 
@@ -975,14 +964,20 @@ async def bootstrap_workspace(req: BootstrapRequest, request: Request):
                 import ssl
                 import tempfile
 
-                # Bypass SSL verification for Maven Central (macOS lacks system certs)
                 ssl_ctx = ssl.create_default_context()
-                ssl_ctx.check_hostname = False
-                ssl_ctx.verify_mode = ssl.CERT_NONE
+                try:
+                    import certifi
+                    ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+                except ImportError:
+                    ssl_ctx.check_hostname = False
+                    ssl_ctx.verify_mode = ssl.CERT_NONE
+
+                tmp_path = None
                 with tempfile.NamedTemporaryFile(suffix=".jar", delete=False) as tmp:
-                    with urllib.request.urlopen(maven_url, context=ssl_ctx) as resp:
-                        tmp.write(resp.read())
                     tmp_path = tmp.name
+                with urllib.request.urlopen(maven_url, context=ssl_ctx) as resp:
+                    with open(tmp_path, "wb") as f:
+                        f.write(resp.read())
 
                 with open(tmp_path, "rb") as f:
                     jar_bytes = f.read()
@@ -1096,7 +1091,7 @@ async def create_datagen_job(req: DataGenJobRequest, request: Request):
 @router.post("/databricks/create-job")
 async def create_job(req: JobCreateRequest, request: Request):
     try:
-        w = get_workspace_client_with_token(req.admin_token, req.workspace_url) if req.admin_token else get_workspace_client(request)
+        w = _get_ws(req.workspace_url, req.admin_token, request)
 
         jar_path = req.jar_path
         if not jar_path:
@@ -1116,35 +1111,83 @@ async def create_job(req: JobCreateRequest, request: Request):
         }
 
         if req.compute_mode == "serverless":
-            # Serverless: no job_clusters; environments block enables serverless execution
-            # JAR libraries are not supported at task level for serverless — pass jar_path
-            # as a base_parameter so the notebook can load it via sc.addJar() if needed
-            base_parameters["jar_path"] = jar_path
-            job_settings = {
-                "name": req.job_name,
-                "environments": [
-                    {
-                        "environment_key": "Default",
-                        "spec": {
-                            "client": "1",
-                            "dependencies": [],
+            notebook_path = req.notebook_path or _resolve_notebook_path(w, "benchmark_databricks_notebook")
+
+            if req.load_type == "batch":
+                # Batch serverless: 2-task job.
+                # Task 1 (classic cluster + JAR): runs only bronze_customer_mgmt XML parse.
+                # Task 2 (serverless, no JAR): runs the full benchmark skipping bronze_customer_mgmt.
+                xml_parse_cluster = {
+                    "spark_version": req.spark_version or "17.3.x-scala2.13",
+                    "node_type_id": req.worker_node_type,
+                    "num_workers": req.num_workers,
+                    "driver_node_type_id": req.driver_node_type,
+                    "runtime_engine": "PHOTON" if req.photon else "STANDARD",
+                    "data_security_mode": "SINGLE_USER",
+                    "spark_conf": {
+                        "spark.databricks.delta.optimizeWrite.enabled": "true",
+                    },
+                    "gcp_attributes": {
+                        "use_preemptible_executors": False,
+                        "local_ssd_count": req.local_ssds,
+                    },
+                }
+                task1_params = {**base_parameters, "bronze_only_customer_mgmt": "true", "separate_customer_mgmt_bronze": "true"}
+                task2_params = {**base_parameters, "separate_customer_mgmt_bronze": "true"}
+                serverless_env = [{"environment_key": "Default", "spec": {"client": "1", "dependencies": []}}]
+                job_settings = {
+                    "name": req.job_name,
+                    "environments": serverless_env,
+                    "job_clusters": [
+                        {"job_cluster_key": "xml_parse_cluster", "new_cluster": xml_parse_cluster}
+                    ],
+                    "tasks": [
+                        {
+                            "task_key": "xml_parse",
+                            "description": "Parse CustomerMgmt.xml on classic cluster (spark-xml JAR required)",
+                            "job_cluster_key": "xml_parse_cluster",
+                            "libraries": [{"jar": jar_path}],
+                            "notebook_task": {
+                                "notebook_path": notebook_path,
+                                "base_parameters": task1_params,
+                                "source": "WORKSPACE",
+                            },
                         },
-                    }
-                ],
-                "tasks": [
-                    {
-                        "task_key": "benchmark_execution",
-                        "environment_key": "Default",
-                        "notebook_task": {
-                            "notebook_path": req.notebook_path or _resolve_notebook_path(w, "benchmark_databricks_notebook"),
-                            "base_parameters": base_parameters,
-                            "source": "WORKSPACE",
+                        {
+                            "task_key": "benchmark_execution",
+                            "description": "Full benchmark on serverless (skips bronze_customer_mgmt)",
+                            "environment_key": "Default",
+                            "depends_on": [{"task_key": "xml_parse"}],
+                            "notebook_task": {
+                                "notebook_path": notebook_path,
+                                "base_parameters": task2_params,
+                                "source": "WORKSPACE",
+                            },
                         },
-                    }
-                ],
-                "timeout_seconds": 0,
-                "max_concurrent_runs": 1,
-            }
+                    ],
+                    "timeout_seconds": 0,
+                    "max_concurrent_runs": 1,
+                }
+            else:
+                # Incremental serverless: single task, no JAR needed
+                serverless_env = [{"environment_key": "Default", "spec": {"client": "1", "dependencies": []}}]
+                job_settings = {
+                    "name": req.job_name,
+                    "environments": serverless_env,
+                    "tasks": [
+                        {
+                            "task_key": "benchmark_execution",
+                            "environment_key": "Default",
+                            "notebook_task": {
+                                "notebook_path": notebook_path,
+                                "base_parameters": base_parameters,
+                                "source": "WORKSPACE",
+                            },
+                        }
+                    ],
+                    "timeout_seconds": 0,
+                    "max_concurrent_runs": 1,
+                }
         else:
             # Classic: provision job cluster with specified node types
             new_cluster = {
@@ -1154,7 +1197,9 @@ async def create_job(req: JobCreateRequest, request: Request):
                 "driver_node_type_id": req.driver_node_type,
                 "runtime_engine": "PHOTON" if req.photon else "STANDARD",
                 "data_security_mode": "SINGLE_USER",
-                "spark_conf": {},
+                "spark_conf": {
+                    "spark.databricks.delta.optimizeWrite.enabled": "true",
+                },
                 "gcp_attributes": {
                     "use_preemptible_executors": False,
                     "local_ssd_count": req.local_ssds,
@@ -1212,7 +1257,7 @@ async def create_job(req: JobCreateRequest, request: Request):
 @router.post("/databricks/run-job")
 async def run_job(req: RunJobRequest, request: Request):
     try:
-        w = get_workspace_client_with_token(req.admin_token, req.workspace_url) if req.admin_token else get_workspace_client(request)
+        w = _get_ws(req.workspace_url, req.admin_token, request)
         wait = w.jobs.run_now(job_id=req.job_id)
         run_id = wait.run_id
         # Build run_page_url from workspace host
@@ -1229,7 +1274,7 @@ async def run_job(req: RunJobRequest, request: Request):
 @router.get("/databricks/job-status/{run_id}")
 async def get_job_status(run_id: int, request: Request, admin_token: str = Query(""), workspace_url: str = Query("")):
     try:
-        w = get_workspace_client_with_token(admin_token, workspace_url) if admin_token else get_workspace_client(request)
+        w = _get_ws(workspace_url, admin_token, request)
         run = w.jobs.get_run(run_id=run_id)
 
         state = run.state
@@ -1464,7 +1509,7 @@ async def _list_metrics_dbfs(w, metrics_path: str):
 async def get_run_cost(run_id: int, request: Request, admin_token: str = Query(""), workspace_url: str = Query("")):
     """Calculate cost breakdown for a completed job run."""
     try:
-        w = get_workspace_client_with_token(admin_token, workspace_url) if admin_token else get_workspace_client(request)
+        w = _get_ws(workspace_url, admin_token, request)
         # Get run details via REST API for raw JSON access
         run_data = w.api_client.do("GET", "/api/2.1/jobs/runs/get", query={"run_id": run_id})
 
@@ -1476,29 +1521,33 @@ async def get_run_cost(run_id: int, request: Request, admin_token: str = Query("
         setup_duration = run_data.get("setup_duration", 0) or 0
         total_duration = exec_duration + setup_duration
 
-        # Detect compute mode: serverless runs have no job_clusters
-        job_clusters = run_data.get("job_clusters", [])
-        is_serverless = len(job_clusters) == 0
+        # Extract cluster config from job_clusters
+        driver_type = "unknown"
+        worker_type = "unknown"
+        num_workers = 0
+        local_ssd_count = 0
 
-        if is_serverless:
-            cost = calculate_serverless_cost(duration_ms=total_duration)
-        else:
+        job_clusters = run_data.get("job_clusters", [])
+        if job_clusters:
             cluster_spec = job_clusters[0].get("new_cluster", {})
             driver_type = cluster_spec.get("driver_node_type_id", cluster_spec.get("node_type_id", "unknown"))
             worker_type = cluster_spec.get("node_type_id", driver_type)
             num_workers = cluster_spec.get("num_workers", 0)
             gcp_attrs = cluster_spec.get("gcp_attributes", {})
-            local_ssd_count = gcp_attrs.get("local_ssd_count", 1)
-            photon = cluster_spec.get("runtime_engine", "") == "PHOTON"
+            local_ssd_count = gcp_attrs.get("local_ssd_count", 1)  # GCP default: 1 local SSD per node
 
-            cost = calculate_run_cost(
-                driver_type=driver_type,
-                worker_type=worker_type,
-                num_workers=num_workers,
-                duration_ms=total_duration,
-                local_ssd_count=local_ssd_count,
-                photon=photon,
-            )
+        photon = False
+        if job_clusters:
+            photon = job_clusters[0].get("new_cluster", {}).get("runtime_engine", "") == "PHOTON"
+
+        cost = calculate_run_cost(
+            driver_type=driver_type,
+            worker_type=worker_type,
+            num_workers=num_workers,
+            duration_ms=total_duration,
+            local_ssd_count=local_ssd_count,
+            photon=photon,
+        )
 
         cost["run_id"] = run_id
         cost["state"] = lifecycle
@@ -1520,7 +1569,7 @@ async def get_run_cost(run_id: int, request: Request, admin_token: str = Query("
 async def cancel_run(run_id: int, request: Request, admin_token: str = Query(""), workspace_url: str = Query("")):
     """Cancel a running job."""
     try:
-        w = get_workspace_client_with_token(admin_token, workspace_url) if admin_token else get_workspace_client(request)
+        w = _get_ws(workspace_url, admin_token, request)
         w.jobs.cancel_run(run_id=run_id)
         return {"status": "cancelled", "run_id": run_id}
     except Exception as e:
@@ -1550,16 +1599,26 @@ async def delete_run_history(filename: str, request: Request):
     return run_history.delete_run(request, filename)
 
 
+class PatchRunRequest(BaseModel):
+    updates: dict  # Partial fields to merge into the saved run JSON
+
+
+@router.patch("/databricks/run-history/{filename}")
+async def patch_run_history(filename: str, req: PatchRunRequest, request: Request):
+    """Merge updates into an existing run history file."""
+    return run_history.patch_run(request, filename, req.updates)
+
+
 class ResolveTokenRequest(BaseModel):
     token: str
-    workspace_url: str = ""
+    workspace_url: str = ""  # Optional — overrides CLI profile host
 
 
 @router.post("/databricks/resolve-token")
 async def resolve_token(req: ResolveTokenRequest, request: Request):
     """Resolve a PAT token to user info by calling SCIM Me endpoint."""
     try:
-        w = get_workspace_client_with_token(req.token, req.workspace_url)
+        w = _get_ws(req.workspace_url, req.token, request)
         me = w.current_user.me()
         return {
             "status": "ok",

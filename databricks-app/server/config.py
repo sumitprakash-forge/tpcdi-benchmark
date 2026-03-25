@@ -51,6 +51,22 @@ def get_workspace_client_with_token(token: str, workspace_url: str = "") -> Work
     return WorkspaceClient(config=config)
 
 
+def get_workspace_client_with_host(token: str, host: str) -> WorkspaceClient:
+    """Get WorkspaceClient authenticated with a PAT token against an explicit workspace host."""
+    from databricks.sdk.config import Config
+    if host and not host.startswith("http"):
+        host = f"https://{host}"
+    host = host.rstrip("/")
+    config = Config(
+        host=host,
+        token=token,
+        client_id=None,
+        client_secret=None,
+        auth_type="pat",
+    )
+    return WorkspaceClient(config=config)
+
+
 def get_user_email(request: Request = None) -> str:
     """Get the logged-in user's email from Databricks Apps proxy headers."""
     if request:

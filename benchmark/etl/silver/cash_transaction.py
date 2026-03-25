@@ -43,7 +43,7 @@ class SilverCashTransaction(SilverLoaderBase):
         silver_df = parsed_df.select(
             record_type_expr,
             expr("try_cast(trim(_c" + str(offset) + ") AS BIGINT)").alias("ct_ca_id"),   # Spec: CT_CA_ID = Customer account identifier
-            col("_c" + str(offset + 1)).alias("ct_dts"),
+            expr("nullif(trim(_c" + str(offset + 1) + "), '')").alias("ct_dts"),
             expr("coalesce(try_cast(trim(_c" + str(offset + 2) + ") AS DOUBLE), 0)").alias("ct_amt"),
             coalesce(col("_c" + str(offset + 3)), lit("")).alias("ct_name"),
             col("_batch_id").alias("batch_id"),
@@ -52,13 +52,13 @@ class SilverCashTransaction(SilverLoaderBase):
 
         silver_df = silver_df.withColumn(
             "transaction_date",
-            to_timestamp(col("ct_dts"))
+            expr("try_cast(ct_dts AS TIMESTAMP)")
         ).withColumn(
             "ct_key",
             concat_ws("_", col("ct_ca_id").cast("string"), col("ct_dts").cast("string"))
         ).withColumn(
             "effective_date",
-            to_timestamp(col("ct_dts"))
+            expr("try_cast(ct_dts AS TIMESTAMP)")
         ).withColumn(
             "end_date",
             lit(None).cast(TimestampType())

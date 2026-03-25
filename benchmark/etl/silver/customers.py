@@ -287,7 +287,7 @@ class SilverCustomers(SilverLoaderBase):
                 .when(col("c_gndr").isin("F", "f"), "Female")
                 .otherwise("Unknown").alias("gender"),
             expr("try_cast(c_tier AS INT)").alias("tier"),
-            to_date(col("c_dob"), "yyyy-MM-dd").alias("dob"),
+            expr("try_cast(c_dob AS DATE)").alias("dob"),
             col("c_adline1").alias("address_line1"),
             col("c_adline2").alias("address_line2"),
             col("c_zipcode").alias("postal_code"),
@@ -315,7 +315,7 @@ class SilverCustomers(SilverLoaderBase):
         
         # effective_date
         if has_action_type:
-            select_cols.append(to_timestamp(col("action_ts")).alias("effective_date"))
+            select_cols.append(expr("try_cast(action_ts AS TIMESTAMP)").alias("effective_date"))
         else:
             select_cols.append(current_timestamp().alias("effective_date"))
         

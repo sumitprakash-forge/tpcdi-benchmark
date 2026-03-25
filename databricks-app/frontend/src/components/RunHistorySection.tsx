@@ -125,6 +125,7 @@ export default function RunHistorySection({ platform }: RunHistorySectionProps) 
   const [error, setError] = useState<string | null>(null)
   const [expandedRow, setExpandedRow] = useState<string | null>(null)
   const [deleting, setDeleting] = useState<string | null>(null)
+  const [fixing, setFixing] = useState<string | null>(null)
 
   const fetchHistory = async () => {
     setLoading(true)
@@ -145,6 +146,29 @@ export default function RunHistorySection({ platform }: RunHistorySectionProps) 
   }
 
   useEffect(() => { fetchHistory() }, [platform])
+
+  const handleFixStatus = async (entry: RunHistoryEntry) => {
+    setFixing(entry._filename)
+    try {
+      // Mark all non-prereq steps that show 'running' as 'success' since pipeline completed
+      const fixedSteps = (entry.steps || []).map(s => {
+        if (s.status === 'running') return { ...s, status: 'success' }
+        return s
+      })
+      const allSuccess = fixedSteps.every(s => s.status === 'success')
+      const res = await fetch(`/api/databricks/run-history/${encodeURIComponent(entry._filename)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ updates: { status: allSuccess ? 'completed' : 'failed', steps: fixedSteps } }),
+      })
+      if (!res.ok) throw new Error('Fix failed')
+      await fetchHistory()
+    } catch (e: any) {
+      setError(e.message)
+    } finally {
+      setFixing(null)
+    }
+  }
 
   const handleDelete = async (filename: string) => {
     if (!confirm('Delete this run history entry?')) return
@@ -349,7 +373,26 @@ export default function RunHistorySection({ platform }: RunHistorySectionProps) 
                         <td className="px-4 py-2 text-slate-400">
                           {savedTime ? new Date(savedTime).toLocaleString() : '--'}
                         </td>
-                        <td className="px-4 py-2">
+                        <td className="px-4 py-2 flex items-center gap-1">
+                          {entry.status === 'failed' && (
+                            <button
+                              onClick={(e) => { e.stopPropagation(); handleFixStatus(entry) }}
+                              disabled={fixing === entry._filename}
+                              className="text-green-500 hover:text-green-700 disabled:opacity-50 p-1"
+                              title="Mark running steps as success"
+                            >
+                              {fixing === entry._filename ? (
+                                <svg className="w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none">
+                                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                                </svg>
+                              ) : (
+                                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                                </svg>
+                              )}
+                            </button>
+                          )}
                           <button
                             onClick={(e) => { e.stopPropagation(); handleDelete(entry._filename) }}
                             disabled={deleting === entry._filename}

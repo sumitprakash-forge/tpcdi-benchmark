@@ -251,7 +251,7 @@ class SilverAccounts(SilverLoaderBase):
         if has_action_type:
             select_cols.extend([
                 col("action_type").alias("action_type"),
-                to_timestamp(col("action_ts")).alias("action_timestamp"),
+                expr("try_cast(action_ts AS TIMESTAMP)").alias("action_timestamp"),
             ])
         else:
             select_cols.extend([
@@ -261,7 +261,7 @@ class SilverAccounts(SilverLoaderBase):
         
         if has_action_type:
             select_cols.append(
-                to_date(to_timestamp(col("action_ts"))).alias("effective_date")
+                to_date(expr("try_cast(action_ts AS TIMESTAMP)")).alias("effective_date")
             )
         else:
             select_cols.append(

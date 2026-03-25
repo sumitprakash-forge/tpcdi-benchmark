@@ -85,6 +85,35 @@ def list_runs(request: Request, limit: int = 50) -> list:
         traceback.print_exc()
         return []
 
+def patch_run(request: Request, filename: str, updates: dict) -> dict:
+    """Merge updates into an existing run history file."""
+    try:
+        w = get_workspace_client(request)
+        user_email = get_user_email(request)
+        runs_path = _get_runs_path(w, user_email)
+        file_path = f"{runs_path}/{filename}"
+        # Read existing
+        resp = w.api_client.do("GET", "/api/2.0/workspace/export", query={"path": file_path, "format": "AUTO"})
+        existing = json.loads(base64.b64decode(resp.get("content", "")).decode("utf-8"))
+        # Deep merge steps if provided
+        if "steps" in updates and isinstance(updates["steps"], list) and isinstance(existing.get("steps"), list):
+            for i, step_update in enumerate(updates["steps"]):
+                if step_update and i < len(existing["steps"]):
+                    existing["steps"][i].update(step_update)
+            updates = {k: v for k, v in updates.items() if k != "steps"}
+        existing.update(updates)
+        existing["updated_at"] = datetime.now(timezone.utc).isoformat()
+        content = json.dumps(existing, indent=2, default=str)
+        content_b64 = base64.b64encode(content.encode("utf-8")).decode("utf-8")
+        w.api_client.do("POST", "/api/2.0/workspace/import", body={
+            "path": file_path, "content": content_b64, "format": "AUTO", "overwrite": True,
+        })
+        return {"status": "updated", "path": file_path}
+    except Exception as e:
+        traceback.print_exc()
+        return {"status": "error", "message": str(e)}
+
+
 def delete_run(request: Request, filename: str) -> dict:
     try:
         w = get_workspace_client(request)
